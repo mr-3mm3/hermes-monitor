@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.codegraph/
+
+# local orchestration context (personal paths)
+.hermes.md
