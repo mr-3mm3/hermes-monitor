@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -13,9 +14,54 @@ NOW = 1_700_000_000
 SECRET = "fake-secret-never-return"
 
 
+def _read_key_with_home(root: Path, env_key: str | None = None):
+    environment = {"HERMES_HOME": str(root)}
+    if env_key is not None:
+        environment["DEEPSEEK_API_KEY"] = env_key
+    with patch.dict(os.environ, environment, clear=True):
+        return plugin_api._read_deepseek_key()
+
+
+def _write_env(path: Path, value: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"DEEPSEEK_API_KEY={value}\n", encoding="utf-8")
+
+
 def test_routes_are_relative_and_registered():
     paths = {route.path for route in plugin_api.router.routes}
     assert paths == {"/workers", "/quotas"}
+
+
+def test_deepseek_key_environment_wins_over_files():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _write_env(root / ".env", "root-value")
+        _write_env(root / "profiles" / "alpha" / ".env", "profile-value")
+
+        assert _read_key_with_home(root, "environment-value") == "environment-value"
+
+
+def test_deepseek_key_falls_back_to_root_env():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _write_env(root / ".env", "root-value")
+        _write_env(root / "profiles" / "alpha" / ".env", "profile-value")
+
+        assert _read_key_with_home(root) == "root-value"
+
+
+def test_deepseek_key_uses_first_profile_alphabetically():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _write_env(root / "profiles" / "zulu" / ".env", "zulu-value")
+        _write_env(root / "profiles" / "alpha" / ".env", "alpha-value")
+
+        assert _read_key_with_home(root) == "alpha-value"
+
+
+def test_deepseek_key_is_none_when_unconfigured():
+    with tempfile.TemporaryDirectory() as directory:
+        assert _read_key_with_home(Path(directory)) is None
 
 
 def test_sqlite_connections_are_enforced_read_only():
