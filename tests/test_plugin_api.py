@@ -1,9 +1,12 @@
 import asyncio
+import contextlib
+import io
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,6 +108,88 @@ def test_quotas_endpoint_source_failure_is_nd_and_secret_free():
 
     assert [provider["status"] for provider in result["providers"]] == ["n/a", "n/a", "n/a"]
     assert CANARY not in json.dumps(result)
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def test_deepseek_balance_valid_response_is_mapped_without_exposing_key():
+    response = _FakeResponse(b'{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"4.50"}]}')
+    with patch.object(plugin_api, "_read_deepseek_key", lambda: CANARY), patch.object(
+        plugin_api.urllib.request, "urlopen", return_value=response
+    ):
+        source = plugin_api._fetch_deepseek_balance()
+
+    result = plugin_api.build_quotas_response({"deepseek": source}, now=NOW)
+    assert result["providers"][2]["balance"] == {"currency": "USD", "amount": 4.5}
+    assert CANARY not in json.dumps(result)
+
+
+def test_deepseek_missing_key_is_unavailable_without_network_or_secret_output():
+    output = io.StringIO()
+    with patch.object(plugin_api, "_read_deepseek_key", return_value=None), patch.object(
+        plugin_api.urllib.request, "urlopen"
+    ) as urlopen, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        source = asyncio.run(plugin_api._limited_call(plugin_api._fetch_deepseek_balance))
+
+    result = plugin_api.build_quotas_response({"deepseek": source}, now=NOW)
+    assert result["providers"][2] == {
+        "id": "deepseek", "label": "DeepSeek", "status": "n/a", "balance": None, "windows": []
+    }
+    urlopen.assert_not_called()
+    assert CANARY not in output.getvalue()
+
+
+def test_deepseek_http_error_timeout_and_malformed_json_are_secret_free_and_unavailable():
+    failures = (
+        urllib.error.URLError(CANARY),
+        TimeoutError(CANARY),
+        _FakeResponse(b"not-json"),
+    )
+    for failure in failures:
+        output = io.StringIO()
+        urlopen = patch.object(plugin_api.urllib.request, "urlopen", side_effect=failure) if isinstance(
+            failure, BaseException
+        ) else patch.object(plugin_api.urllib.request, "urlopen", return_value=failure)
+        with patch.object(plugin_api, "_read_deepseek_key", return_value=CANARY), urlopen, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            source = asyncio.run(plugin_api._limited_call(plugin_api._fetch_deepseek_balance))
+
+        result = plugin_api.build_quotas_response({"deepseek": source}, now=NOW)
+        assert result["providers"][2]["status"] == "n/a"
+        assert result["providers"][2]["balance"] is None
+        assert CANARY not in json.dumps(result)
+        assert CANARY not in output.getvalue()
+
+
+def test_collection_isolates_failed_provider_and_preserves_two_healthy_sources():
+    def fake_account_usage(provider):
+        if provider == "anthropic":
+            raise TimeoutError(CANARY)
+        return {"windows": [{"label": "primary", "used_percent": 20, "reset_at": NOW}]}
+
+    deepseek = {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "3"}]}
+    output = io.StringIO()
+    with patch.object(plugin_api, "_fetch_account_usage", fake_account_usage), patch.object(
+        plugin_api, "_fetch_deepseek_balance", return_value=deepseek
+    ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    result = plugin_api.build_quotas_response(sources, now=NOW)
+    assert [provider["status"] for provider in result["providers"]] == ["n/a", "ok", "ok"]
+    assert CANARY not in json.dumps(result)
+    assert CANARY not in output.getvalue()
 
 
 def test_worker_tool_events_expose_only_name_hash_and_timestamp():

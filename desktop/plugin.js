@@ -56,6 +56,21 @@ const STATE_COLOR = { active: GREEN, stalled: ORANGE, loop: RED }
 const CHIP_CLASS =
   'inline-flex h-full items-center gap-1 whitespace-nowrap rounded-none px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground'
 
+// Footer items lay their content out in a single row through inline styles,
+// not through Tailwind arbitrary utilities. The desktop app ships a prebuilt
+// Tailwind bundle: arbitrary utilities used only by plugins (e.g.
+// `grid-cols-[auto_1.75rem_2.25rem_auto]`) are never generated, so an element
+// left with `inline-grid` and no grid template collapses to a SINGLE implicit
+// column — label, bar and value stack vertically and the statusbar (a few tens
+// of px tall) clips the trailing rows. Inline styles always apply, so the row
+// layout cannot silently regress.
+const FOOTER_ROW = {
+  display: 'inline-flex',
+  flexDirection: 'row',
+  alignItems: 'center',
+  whiteSpace: 'nowrap'
+}
+
 // -- pure helpers -------------------------------------------------------------
 
 function clampPct(value) {
@@ -266,6 +281,7 @@ function WorkerChip({ ctx }) {
     children: jsxs('button', {
       type: 'button',
       className: CHIP_CLASS,
+      style: { ...FOOTER_ROW, gap: '0.25rem' },
       'aria-label': statusLabel,
       children:
         count > 0
@@ -323,7 +339,7 @@ function WorkerChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
-        className: 'min-w-72',
+        style: { minWidth: '18rem' },
         children: menuChildren
       })
     ]
@@ -332,33 +348,51 @@ function WorkerChip({ ctx }) {
 
 // -- Quote item ---------------------------------------------------------------
 
-/** Footer read-out for one window: label, mini-bar, % used, local reset hour. */
+/**
+ * Footer read-out for one window: label, mini-bar and % used on ONE row.
+ * The reset hour is deliberately left to the click menu: the footer must stay
+ * narrow enough for four provider groups to fit without being clipped.
+ */
 function renderWindowBar(win) {
   const hasPct = Number.isFinite(win.used_percent)
   const pct = clampPct(win.used_percent)
   return jsxs('span', {
-    className: 'inline-grid grid-cols-[auto_1.75rem_2.25rem_auto] items-center gap-x-1',
+    className: 'inline-flex items-center gap-1',
+    style: { ...FOOTER_ROW, gap: '0.25rem', flex: '0 0 auto' },
     children: [
       jsx('span', {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+        style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
         children: win.label || '—'
       }),
       jsx('span', {
-        className: 'relative block h-2 w-7 shrink-0 overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        className: 'overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        style: {
+          position: 'relative',
+          display: 'block',
+          width: '1.75rem',
+          height: '0.5rem',
+          borderRadius: '2px',
+          flex: '0 0 auto'
+        },
         children: hasPct
           ? jsx('span', {
-              className: 'absolute inset-y-0 left-0 rounded-sm',
-              style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
+              className: 'rounded-sm',
+              style: {
+                position: 'absolute',
+                top: 0,
+                bottom: 0,
+                left: 0,
+                width: `${pct}%`,
+                backgroundColor: quotaColor(pct)
+              }
             })
           : null
       }),
       jsx('span', {
         className: 'tabular-nums text-[0.625rem] text-(--ui-text-secondary)',
+        style: { whiteSpace: 'nowrap', lineHeight: 1, minWidth: '1.75rem', flex: '0 0 auto' },
         children: hasPct ? `${Math.round(pct)}%` : 'n/a'
-      }),
-      jsx('span', {
-        className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-        children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'reset n/a'
       })
     ]
   }, win.label)
@@ -367,27 +401,44 @@ function renderWindowBar(win) {
 function renderProviderChip(p) {
   const nok = p.status !== 'ok'
   const windows = Array.isArray(p.windows) ? p.windows : []
+  // One bar per provider in the footer: Claude -> its 5h window only, Codex ->
+  // its primary window. Every window (with its reset hour) stays in the menu.
   const footerWindows = p.id === 'claude'
-    ? windows.filter(win => String(win.label || '').toLowerCase() === '5h').slice(0, 1)
-    : windows
+    ? windows.filter(win => String(win.label || '').trim().toLowerCase() === '5h').slice(0, 1)
+    : windows.slice(0, 1)
   const value = nok
-    ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
+    ? jsx('span', {
+        className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+        style: { whiteSpace: 'nowrap', lineHeight: 1 },
+        children: 'n/a'
+      })
     : p.id === 'deepseek'
       ? jsx('span', {
           className: 'font-medium tabular-nums text-(--ui-text-secondary)',
+          style: { whiteSpace: 'nowrap', lineHeight: 1 },
           children: formatBalance(p.balance)
         })
       : footerWindows.length > 0
         ? jsxs('span', {
             className: 'inline-flex items-center gap-2',
+            style: { ...FOOTER_ROW, gap: '0.5rem', flex: '0 0 auto' },
             children: footerWindows.map(renderWindowBar)
           })
-        : jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
+        : jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            style: { whiteSpace: 'nowrap', lineHeight: 1 },
+            children: 'n/a'
+          })
 
   return jsxs('span', {
-    className: 'inline-grid grid-cols-[auto_auto] items-center gap-x-1.5',
+    className: 'inline-flex items-center',
+    style: { ...FOOTER_ROW, gap: '0.375rem', flex: '0 0 auto' },
     children: [
-      jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: p.label || p.id }),
+      jsx('span', {
+        className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+        style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
+        children: p.label || p.id
+      }),
       value
     ]
   }, p.id)
@@ -396,11 +447,17 @@ function renderProviderChip(p) {
 function renderWindowDetail(win) {
   const pct = clampPct(win.used_percent)
   return jsxs('div', {
-    className: 'grid w-full grid-cols-[4rem_minmax(5rem,1fr)_2.5rem_4.5rem] items-center gap-x-2',
+    className: 'w-full',
+    style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%' },
     children: [
-      jsx('span', { className: 'w-16 shrink-0 text-(--ui-text-quaternary)', children: win.label }),
       jsx('span', {
-        className: 'h-2 w-full overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        className: 'text-(--ui-text-quaternary)',
+        style: { width: '4rem', flex: '0 0 4rem' },
+        children: win.label
+      }),
+      jsx('span', {
+        className: 'overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        style: { height: '0.5rem', minWidth: '5rem', flex: '1 1 auto' },
         children: jsx('span', {
           className: 'block h-full rounded-sm',
           style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
@@ -408,10 +465,12 @@ function renderWindowDetail(win) {
       }),
       jsx('span', {
         className: 'text-right tabular-nums text-(--ui-text-secondary)',
+        style: { width: '2.5rem', flex: '0 0 2.5rem' },
         children: `${Math.round(win.used_percent)}%`
       }),
       jsx('span', {
         className: 'text-right text-(--ui-text-quaternary)',
+        style: { width: '4.5rem', flex: '0 0 4.5rem' },
         children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/a'
       })
     ]
@@ -478,6 +537,7 @@ function QuoteChip({ ctx }) {
     children: jsx('button', {
       type: 'button',
       className: CHIP_CLASS,
+      style: { ...FOOTER_ROW, gap: '0.375rem' },
       'aria-label': error ? 'Quotas: unavailable' : 'Plan quotas',
       children: providers.length > 0
         ? chipNodes
@@ -507,7 +567,7 @@ function QuoteChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
-        className: 'min-w-80',
+        style: { minWidth: '20rem' },
         children: menuChildren
       })
     ]
