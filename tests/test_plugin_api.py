@@ -107,6 +107,18 @@ def test_quotas_endpoint_source_failure_is_nd_and_secret_free():
     assert CANARY not in json.dumps(result)
 
 
+def test_worker_tool_events_expose_only_name_hash_and_timestamp():
+    raw = [{"function": {"name": "terminal", "arguments": {"command": CANARY, "token": CANARY}}}]
+
+    events = plugin_api._extract_calls(raw, 123.0)
+
+    assert len(events) == 1
+    assert set(events[0]) == {"tool_name", "arguments_hash", "timestamp"}
+    assert events[0]["tool_name"] == "terminal"
+    assert len(events[0]["arguments_hash"]) == 16
+    assert CANARY not in json.dumps(events)
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

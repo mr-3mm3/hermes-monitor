@@ -14,6 +14,7 @@ import os
 import sqlite3
 import time
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -86,7 +87,7 @@ def _hermes_home() -> Path:
 
 def _load_running_tasks() -> list[dict[str, Any]]:
     database = _hermes_home() / "kanban.db"
-    with _readonly_connection(database) as connection:
+    with closing(_readonly_connection(database)) as connection:
         rows = connection.execute(
             "SELECT id, title, assignee, started_at FROM tasks WHERE status = ? ORDER BY started_at, id",
             ("running",),
@@ -127,7 +128,7 @@ def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     if database is None:
         return []
     started = float(task.get("started_at") or 0)
-    with _readonly_connection(database) as connection:
+    with closing(_readonly_connection(database)) as connection:
         session = connection.execute(
             "SELECT id FROM sessions WHERE source = ? AND started_at >= ? ORDER BY ABS(started_at - ?) LIMIT 1",
             ("kanban", started - 60, started),

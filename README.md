@@ -8,6 +8,8 @@ Hermes Monitor adds two compact items to the right side of the Hermes Desktop fo
 [Worker 2 · build · 18 s ago]  [Claude 34% 12:40 · Codex 61% 14:00 · DeepSeek $7.25]
 ```
 
+![Footer](docs/footer.png)
+
 Open the Worker item to see each running card, its title, assignee, runtime, last activity, and a link to Kanban. Open the Quotas item for the full Claude, Codex, and DeepSeek details. Both menus request a fresh reading when opened.
 
 ## Requirements
@@ -31,6 +33,17 @@ hermes plugins enable hermes-monitor
 
 Quit Hermes Desktop completely with Command-Q, then reopen it. In the app, open Capabilities -> Plugins and enable Hermes Monitor.
 
+### From a local checkout
+
+To run the plugin from a working copy instead of an installed release, symlink the package into the Hermes plugin directory:
+
+```sh
+ln -s "$PWD" ~/.hermes/plugins/hermes-monitor
+hermes plugins enable hermes-monitor
+```
+
+Add `hermes-monitor` to `plugins.enabled` if the enable command is unavailable, then restart the gateway (`hermes gateway restart`) so the backend routes are loaded, and quit and reopen Hermes Desktop so the footer items appear.
+
 ## Worker health states
 
 Hermes Monitor reads running Kanban cards and their local worker activity:
@@ -52,6 +65,17 @@ DeepSeek credentials are resolved from the process environment, the Hermes root 
 The backend opens the local Kanban and worker session databases in read-only mode. It returns activity metadata only. Message content and tool arguments never reach the frontend; arguments are represented by hashes for loop detection.
 
 Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call and the account-usage API calls already used by Hermes for Claude and Codex. Each external call has a 15-second timeout, and quota results are cached for five minutes.
+
+## Development
+
+Requirements: Python 3.11+ with `pytest`, and Node.js for the syntax check. The backend tests are pure logic with fixtures and never make real network calls.
+
+```sh
+python3 -m pytest tests/ -q
+node --check desktop/plugin.js
+```
+
+The backend lives in `dashboard/` (`plugin_api.py` wires the routes, `workers.py` and `quotas.py` hold the pure transformations) and the Desktop half is the single module `desktop/plugin.js`.
 
 ## Related
 
