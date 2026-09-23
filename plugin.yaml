@@ -1,0 +1,9 @@
+name: hermes-monitor
+label: Hermes Monitor
+version: 0.1.0
+description: Kanban worker health (live activity, stall and loop detection) and provider quota status in the Hermes Desktop status bar.
+requires_hermes: ">=0.21"
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+requires_env: []
