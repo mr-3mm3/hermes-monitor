@@ -33,7 +33,7 @@ def test_quota_response_has_exact_provider_order_and_shape():
         "providers": [
             {"id": "claude", "label": "Claude", "status": "ok", "windows": [
                 {"label": "5h", "used_percent": 12.5, "reset_at": NOW + 10},
-                {"label": "settimana", "used_percent": 33.0, "reset_at": None},
+                {"label": "week", "used_percent": 33.0, "reset_at": None},
             ]},
             {"id": "codex", "label": "Codex", "status": "ok", "windows": [
                 {"label": "5 hour", "used_percent": 40.0, "reset_at": NOW + 20},
@@ -53,9 +53,9 @@ def test_each_failed_or_malformed_source_degrades_independently():
     assert result == {
         "generated_at": NOW,
         "providers": [
-            {"id": "claude", "label": "Claude", "status": "n/d", "windows": []},
-            {"id": "codex", "label": "Codex", "status": "n/d", "windows": []},
-            {"id": "deepseek", "label": "DeepSeek", "status": "n/d", "balance": None, "windows": []},
+            {"id": "claude", "label": "Claude", "status": "n/a", "windows": []},
+            {"id": "codex", "label": "Codex", "status": "n/a", "windows": []},
+            {"id": "deepseek", "label": "DeepSeek", "status": "n/a", "balance": None, "windows": []},
         ],
     }
     assert CANARY not in json.dumps(result)

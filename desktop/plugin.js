@@ -43,7 +43,7 @@ const ID = 'hermes-monitor'
 const WORKER_INTERVAL_MS = 10_000
 const QUOTA_INTERVAL_MS = 300_000
 
-// Traffic-light colors for the semaforo states. Mid-saturation hues that stay
+// Traffic-light colors for the worker states. Mid-saturation hues that stay
 // legible on both the light and dark themes (bars + status dots).
 const GREEN = '#22c55e'
 const ORANGE = '#f59e0b'
@@ -72,9 +72,9 @@ function pad2(n) {
   return String(n).padStart(2, '0')
 }
 
-/** epoch seconds -> local "HH:MM"; null/undefined/garbage -> "n/d". */
+/** epoch seconds -> local "HH:MM"; null/undefined/garbage -> "n/a". */
 function formatResetTime(epoch) {
-  if (!Number.isFinite(epoch)) return 'n/d'
+  if (!Number.isFinite(epoch)) return 'n/a'
   const d = new Date(epoch * 1000)
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 }
@@ -89,18 +89,18 @@ function formatDuration(totalSeconds) {
   return `${sec}s`
 }
 
-/** seconds-since-last-activity -> "N s fa" / "N min fa" / "N h fa". */
+/** seconds-since-last-activity -> "Ns ago" / "Nm ago" / "Nh ago". */
 function formatLastActivity(sec) {
-  if (!Number.isFinite(sec)) return 'n/d'
+  if (!Number.isFinite(sec)) return 'n/a'
   const s = Math.max(0, Math.floor(sec))
-  if (s < 60) return `${s} s fa`
+  if (s < 60) return `${s}s ago`
   const m = Math.floor(s / 60)
-  if (m < 60) return `${m} min fa`
-  return `${Math.floor(m / 60)} h fa`
+  if (m < 60) return `${m}m ago`
+  return `${Math.floor(m / 60)}h ago`
 }
 
 function formatBalance(balance) {
-  if (!balance || typeof balance.amount !== 'number') return 'n/d'
+  if (!balance || typeof balance.amount !== 'number') return 'n/a'
   const code = String(balance.currency || '').toUpperCase()
   const symbol = code === 'USD' ? '$' : code === 'EUR' ? '€' : code === 'CNY' ? '¥' : code ? `${code} ` : ''
   return `${symbol}${balance.amount.toFixed(2)}`
@@ -123,7 +123,7 @@ function worstWorkerState(workers) {
  * A failed request — poll or fresh — never leaves stale numbers on screen:
  * React Query keeps the last successful `data` across a failed refetch, so the
  * failure is turned into a neutral `null` snapshot plus `error: true` and the
- * chips render their "n/d" / inactive state. Rejections stay contained here.
+ * chips render their "n/a" / inactive state. Rejections stay contained here.
  */
 function useMonitor(ctx, path, intervalMs) {
   const query = useQuery({
@@ -214,7 +214,7 @@ function renderWorkerRow(w) {
             }),
             jsx('span', {
               className: 'min-w-0 flex-1 truncate font-medium',
-              children: w.title || w.card_id || '(senza titolo)'
+              children: w.title || w.card_id || '(untitled)'
             }),
             jsx('span', {
               className: 'shrink-0 tabular-nums text-(--ui-text-quaternary)',
@@ -228,7 +228,7 @@ function renderWorkerRow(w) {
             jsx('span', { className: 'shrink-0 font-mono', children: w.card_id || '—' }),
             jsx('span', { children: '·' }),
             jsx('span', { className: 'min-w-0 flex-1 truncate', children: w.assignee || '—' }),
-            jsx('span', { className: 'shrink-0', children: `ultima attività ${formatLastActivity(w.last_activity_s)}` })
+            jsx('span', { className: 'shrink-0', children: `last activity ${formatLastActivity(w.last_activity_s)}` })
           ]
         })
       ]
@@ -251,10 +251,10 @@ function WorkerChip({ ctx }) {
       : null
 
   const statusLabel = error
-    ? 'Worker: dati non disponibili'
+    ? 'Workers: unavailable'
     : count > 0
-      ? `Worker: ${count} ${count === 1 ? 'attivo' : 'attivi'}`
-      : 'Nessun worker attivo'
+      ? `Workers: ${count} active`
+      : 'No active workers'
 
   const handleOpenChange = open => (open ? refreshFresh() : close())
 
@@ -270,7 +270,7 @@ function WorkerChip({ ctx }) {
               jsx('span', {
                 className: 'inline-flex items-center',
                 style: { color },
-                children: jsx(GlyphSpinner, { className: 'text-[0.8125rem]', ariaLabel: 'Worker attivi' })
+                children: jsx(GlyphSpinner, { className: 'text-[0.8125rem]', ariaLabel: 'Active workers' })
               }),
               jsx('span', { className: 'tabular-nums text-(--ui-text-secondary)', children: String(count) })
             ]
@@ -285,10 +285,10 @@ function WorkerChip({ ctx }) {
     jsx('div', {
       className: 'px-2 pt-1 pb-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
       children: error
-        ? 'Worker n/d'
+        ? 'Workers n/a'
         : count > 0
-          ? `${count} worker ${count === 1 ? 'attivo' : 'attivi'}`
-          : 'Nessun worker attivo'
+          ? `${count} active worker${count === 1 ? '' : 's'}`
+          : 'No active workers'
     }, 'header')
   ]
 
@@ -307,7 +307,7 @@ function WorkerChip({ ctx }) {
             // Bridge unavailable: nothing to open, never break the menu.
           }
         },
-        children: [jsx(icons.ExternalLink, { className: 'size-3.5' }), jsx('span', { children: 'Apri Kanban' })]
+        children: [jsx(icons.ExternalLink, { className: 'size-3.5' }), jsx('span', { children: 'Open Kanban' })]
       }, 'kanban')
     )
   }
@@ -350,11 +350,11 @@ function renderWindowBar(win) {
       }),
       jsx('span', {
         className: 'tabular-nums text-[0.625rem] text-(--ui-text-secondary)',
-        children: hasPct ? `${Math.round(pct)}%` : 'n/d'
+        children: hasPct ? `${Math.round(pct)}%` : 'n/a'
       }),
       jsx('span', {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-        children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'reset n/d'
+        children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'reset n/a'
       })
     ]
   }, win.label)
@@ -364,7 +364,7 @@ function renderProviderChip(p) {
   const nok = p.status !== 'ok'
   const windows = Array.isArray(p.windows) ? p.windows : []
   const value = nok
-    ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/d' })
+    ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
     : p.id === 'deepseek'
       ? jsx('span', {
           className: 'font-medium tabular-nums text-(--ui-text-secondary)',
@@ -375,7 +375,7 @@ function renderProviderChip(p) {
             className: 'inline-flex items-center gap-1.5',
             children: windows.map(renderWindowBar)
           })
-        : jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/d' })
+        : jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
 
   return jsxs('span', {
     className: 'inline-flex items-center gap-1',
@@ -405,7 +405,7 @@ function renderWindowDetail(win) {
       }),
       jsx('span', {
         className: 'w-16 shrink-0 text-right text-(--ui-text-quaternary)',
-        children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/d'
+        children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/a'
       })
     ]
   }, win.label)
@@ -421,7 +421,7 @@ function renderProviderDetail(p) {
             jsxs('div', {
               className: 'flex w-full items-center gap-2',
               children: [
-                jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Saldo residuo' }),
+                jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Remaining balance' }),
                 jsx('span', {
                   className: 'ml-auto font-medium tabular-nums text-(--ui-text-secondary)',
                   children: formatBalance(p.balance)
@@ -440,7 +440,7 @@ function renderProviderDetail(p) {
           className: 'flex w-full items-center gap-1.5',
           children: [
             jsx('span', { className: 'font-medium text-(--ui-text-secondary)', children: p.label || p.id }),
-            nok ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'n/d' }) : null
+            nok ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'n/a' }) : null
           ]
         }),
         ...details
@@ -471,10 +471,10 @@ function QuoteChip({ ctx }) {
     children: jsx('button', {
       type: 'button',
       className: CHIP_CLASS,
-      'aria-label': error ? 'Quote: dati non disponibili' : 'Quote piani',
+      'aria-label': error ? 'Quotas: unavailable' : 'Plan quotas',
       children: providers.length > 0
         ? chipNodes
-        : jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Quote n/d' })
+        : jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Quotas n/a' })
     })
   })
 
@@ -487,7 +487,7 @@ function QuoteChip({ ctx }) {
     menuChildren.push(
       jsx('div', {
         className: 'px-2 py-1 text-[0.625rem] text-(--ui-text-quaternary)',
-        children: error ? 'Quote n/d — dati non disponibili' : 'Nessun dato quote disponibile'
+        children: error ? 'Quotas n/a — unavailable' : 'No quota data'
       }, 'empty')
     )
   }
@@ -495,7 +495,7 @@ function QuoteChip({ ctx }) {
   return jsxs(DropdownMenu, {
     onOpenChange: handleOpenChange,
     children: [
-      withTooltip(trigger, 'Quote piani'),
+      withTooltip(trigger, 'Plan quotas'),
       jsx(DropdownMenuContent, {
         align: 'end',
         side: 'top',

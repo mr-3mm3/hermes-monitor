@@ -43,28 +43,28 @@ def _windows(snapshot: Any) -> list[Any]:
 
 def _claude(source: Any) -> dict[str, Any]:
     if source is None or isinstance(source, BaseException):
-        return {"id": "claude", "label": "Claude", "status": "n/d", "windows": []}
+        return {"id": "claude", "label": "Claude", "status": "n/a", "windows": []}
     indexed = {str(_value(item, "label", "")).lower().replace("-", "_").replace(" ", "_"): item for item in _windows(source)}
     # agent.account_usage labels Claude windows "Current session" (five_hour) and "Current week" (seven_day)
     five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h", "current_session", "session"}), None)
     week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly", "current_week"}), None)
-    normalized = [_window(five, "5h"), _window(week, "settimana")]
+    normalized = [_window(five, "5h"), _window(week, "week")]
     if any(item is None for item in normalized):
-        return {"id": "claude", "label": "Claude", "status": "n/d", "windows": []}
+        return {"id": "claude", "label": "Claude", "status": "n/a", "windows": []}
     return {"id": "claude", "label": "Claude", "status": "ok", "windows": normalized}
 
 
 def _codex(source: Any) -> dict[str, Any]:
     if source is None or isinstance(source, BaseException):
-        return {"id": "codex", "label": "Codex", "status": "n/d", "windows": []}
+        return {"id": "codex", "label": "Codex", "status": "n/a", "windows": []}
     normalized = [_window(item) for item in _windows(source)]
     if not normalized or any(item is None for item in normalized):
-        return {"id": "codex", "label": "Codex", "status": "n/d", "windows": []}
+        return {"id": "codex", "label": "Codex", "status": "n/a", "windows": []}
     return {"id": "codex", "label": "Codex", "status": "ok", "windows": normalized}
 
 
 def _deepseek(source: Any) -> dict[str, Any]:
-    unavailable = {"id": "deepseek", "label": "DeepSeek", "status": "n/d", "balance": None, "windows": []}
+    unavailable = {"id": "deepseek", "label": "DeepSeek", "status": "n/a", "balance": None, "windows": []}
     if source is None or isinstance(source, BaseException) or not isinstance(source, Mapping):
         return unavailable
     balances = source.get("balance_infos")

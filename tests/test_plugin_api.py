@@ -103,7 +103,7 @@ def test_quotas_endpoint_source_failure_is_nd_and_secret_free():
         plugin_api._quotas_cache.clear()
         result = asyncio.run(plugin_api.get_quotas(fresh=1))
 
-    assert [provider["status"] for provider in result["providers"]] == ["n/d", "n/d", "n/d"]
+    assert [provider["status"] for provider in result["providers"]] == ["n/a", "n/a", "n/a"]
     assert CANARY not in json.dumps(result)
 
 
