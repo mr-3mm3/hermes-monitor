@@ -127,11 +127,11 @@ def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
             return []
         rows = connection.execute(
             "SELECT tool_calls, timestamp FROM messages WHERE session_id = ? AND tool_calls IS NOT NULL "
-            "AND active = 1 AND compacted = 0 ORDER BY timestamp, id LIMIT 200",
+            "AND active = 1 AND compacted = 0 ORDER BY timestamp DESC, id DESC LIMIT 200",
             (session[0],),
         ).fetchall()
     events: list[dict[str, Any]] = []
-    for tool_calls, timestamp in rows:
+    for tool_calls, timestamp in reversed(rows):
         events.extend(_extract_calls(tool_calls, float(timestamp)))
     return events
 
@@ -180,7 +180,7 @@ def _fetch_deepseek_balance() -> Any:
 async def _limited_call(function: Callable[..., Any], *args: Any) -> Any:
     try:
         return await asyncio.wait_for(asyncio.to_thread(function, *args), timeout=TIMEOUT_S)
-    except BaseException:
+    except Exception:
         return None
 
 
