@@ -11,7 +11,7 @@ from dashboard import plugin_api
 
 
 NOW = 1_700_000_000
-SECRET = "fake-secret-never-return"
+CANARY = "canary-value-must-not-appear"
 
 
 def _read_key_with_home(root: Path, env_key: str | None = None):
@@ -97,14 +97,14 @@ def test_workers_endpoint_exact_shape_and_fresh_bypasses_cache():
 
 def test_quotas_endpoint_source_failure_is_nd_and_secret_free():
     async def fake_sources():
-        return {"anthropic": RuntimeError(SECRET), "openai-codex": RuntimeError(SECRET), "deepseek": RuntimeError(SECRET)}
+        return {"anthropic": RuntimeError(CANARY), "openai-codex": RuntimeError(CANARY), "deepseek": RuntimeError(CANARY)}
 
     with patch.object(plugin_api, "_collect_quota_sources", fake_sources), patch.object(plugin_api.time, "time", lambda: NOW):
         plugin_api._quotas_cache.clear()
         result = asyncio.run(plugin_api.get_quotas(fresh=1))
 
     assert [provider["status"] for provider in result["providers"]] == ["n/d", "n/d", "n/d"]
-    assert SECRET not in json.dumps(result)
+    assert CANARY not in json.dumps(result)
 
 
 def load_tests(loader, tests, pattern):

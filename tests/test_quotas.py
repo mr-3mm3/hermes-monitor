@@ -5,7 +5,7 @@ from dashboard.quotas import build_quotas_response
 
 
 NOW = 1_700_000_000
-SECRET = "sk-deepseek-do-not-leak"
+CANARY = "canary-value-must-not-appear"
 
 
 def test_quota_response_has_exact_provider_order_and_shape():
@@ -22,7 +22,7 @@ def test_quota_response_has_exact_provider_order_and_shape():
         "deepseek": {
             "is_available": True,
             "balance_infos": [{"currency": "USD", "total_balance": "7.25"}],
-            "request_key": SECRET,
+            "request_key": CANARY,
         },
     }
 
@@ -42,12 +42,12 @@ def test_quota_response_has_exact_provider_order_and_shape():
              "balance": {"currency": "USD", "amount": 7.25}, "windows": []},
         ],
     }
-    assert SECRET not in json.dumps(result)
+    assert CANARY not in json.dumps(result)
 
 
 def test_each_failed_or_malformed_source_degrades_independently():
     result = build_quotas_response(
-        {"anthropic": RuntimeError(SECRET), "openai-codex": None, "deepseek": {"error": SECRET}},
+        {"anthropic": RuntimeError(CANARY), "openai-codex": None, "deepseek": {"error": CANARY}},
         now=NOW,
     )
     assert result == {
@@ -58,7 +58,7 @@ def test_each_failed_or_malformed_source_degrades_independently():
             {"id": "deepseek", "label": "DeepSeek", "status": "n/d", "balance": None, "windows": []},
         ],
     }
-    assert SECRET not in json.dumps(result)
+    assert CANARY not in json.dumps(result)
 
 
 def load_tests(loader, tests, pattern):
