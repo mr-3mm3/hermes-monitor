@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dashboard import plugin_api
@@ -42,6 +43,8 @@ def test_deepseek_key_environment_wins_over_files():
         _write_env(root / "profiles" / "alpha" / ".env", "profile-value")
 
         assert _read_key_with_home(root, "environment-value") == "environment-value"
+        with patch.dict(os.environ, {"HERMES_HOME": str(root), "DEEPSEEK_API_KEY": "environment-value"}, clear=True):
+            assert plugin_api._read_deepseek_credential()[1] == "env"
 
 
 def test_deepseek_key_falls_back_to_root_env():
@@ -51,6 +54,8 @@ def test_deepseek_key_falls_back_to_root_env():
         _write_env(root / "profiles" / "alpha" / ".env", "profile-value")
 
         assert _read_key_with_home(root) == "root-value"
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+            assert plugin_api._read_deepseek_credential()[1] == "root"
 
 
 def test_deepseek_key_uses_first_profile_alphabetically():
@@ -144,9 +149,10 @@ def test_deepseek_missing_key_is_unavailable_without_network_or_secret_output():
         source = asyncio.run(plugin_api._limited_call(plugin_api._fetch_deepseek_balance))
 
     result = plugin_api.build_quotas_response({"deepseek": source}, now=NOW)
-    assert result["providers"][2] == {
-        "id": "deepseek", "label": "DeepSeek", "status": "n/a", "balance": None, "windows": []
-    }
+    deepseek = result["providers"][2]
+    assert deepseek["status"] == "n/a"
+    assert deepseek["balance"] is None
+    assert deepseek["accounts"][0]["status"] == "n/a"
     urlopen.assert_not_called()
     assert CANARY not in output.getvalue()
 
@@ -174,7 +180,7 @@ def test_deepseek_http_error_timeout_and_malformed_json_are_secret_free_and_unav
 
 
 def test_collection_isolates_failed_provider_and_preserves_two_healthy_sources():
-    def fake_account_usage(provider):
+    def fake_account_usage(provider, api_key=None, use_pool=True):
         if provider == "anthropic":
             raise TimeoutError(CANARY)
         return {"windows": [{"label": "primary", "used_percent": 20, "reset_at": NOW}]}
@@ -189,6 +195,206 @@ def test_collection_isolates_failed_provider_and_preserves_two_healthy_sources()
     result = plugin_api.build_quotas_response(sources, now=NOW)
     assert [provider["status"] for provider in result["providers"]] == ["n/a", "ok", "ok"]
     assert CANARY not in json.dumps(result)
+    assert CANARY not in output.getvalue()
+
+
+class _FakePool:
+    def __init__(self, entries, active=None):
+        self._entries = entries
+        self._active = active
+
+    def entries(self):
+        return list(self._entries)
+
+    def peek(self):
+        return self._active
+
+
+def _pool_entry(identifier, label, token, priority):
+    return SimpleNamespace(
+        id=identifier,
+        label=label,
+        priority=priority,
+        runtime_api_key=token,
+        access_token=token,
+    )
+
+
+def test_collection_uses_active_pool_account_and_isolates_each_account():
+    first = _pool_entry("first", "primary", "pool-token-one", 0)
+    second = _pool_entry("second", "backup", "pool-token-two", 1)
+    pools = {
+        "anthropic": _FakePool([first, second], first),
+        "openai-codex": _FakePool([first], first),
+    }
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(load_pool=lambda provider: pools[provider])
+        if name == "agent.account_usage":
+            def fetch(provider, api_key=None):
+                if api_key == "pool-token-two":
+                    raise TimeoutError(CANARY)
+                return {
+                    "plan": "Plus" if api_key else "Default",
+                    "windows": [
+                        {"label": "five_hour", "used_percent": 10, "reset_at": NOW},
+                        {"label": "seven_day", "used_percent": 20, "reset_at": NOW},
+                    ],
+                }
+            return SimpleNamespace(fetch_account_usage=fetch)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_fetch_deepseek_balance", side_effect=RuntimeError(CANARY)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+    result = plugin_api.build_quotas_response(sources, now=NOW)
+    claude = result["providers"][0]
+
+    assert claude["account_label"] == "primary"
+    assert claude["plan"] == "Plus"
+    assert claude["pool_size"] == 2
+    assert [account["active"] for account in claude["accounts"]] == [True, False]
+    assert [account["status"] for account in claude["accounts"]] == ["ok", "n/a"]
+    codex = result["providers"][1]
+    assert codex["account_label"] == "primary"
+    assert codex["pool_size"] == 1
+    assert codex["accounts"][0]["active"] is True
+    assert "pool-token-one" not in json.dumps(result)
+    assert "pool-token-two" not in json.dumps(result)
+    assert CANARY not in json.dumps(result)
+
+
+def test_empty_pool_falls_back_to_singleton_without_api_key():
+    calls = []
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(load_pool=lambda provider: _FakePool([], None))
+        if name == "agent.account_usage":
+            def fetch(provider, **kwargs):
+                calls.append((provider, kwargs))
+                return {"plan": "Pro", "windows": [{"label": "primary", "used_percent": 5, "reset_at": NOW}]}
+            return SimpleNamespace(fetch_account_usage=fetch)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_fetch_deepseek_balance", side_effect=RuntimeError(CANARY)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+    result = plugin_api.build_quotas_response(sources, now=NOW)
+    codex = result["providers"][1]
+
+    assert codex["pool_size"] == 0
+    assert codex["accounts"][0]["account_label"] == "default"
+    assert codex["accounts"][0]["active"] is True
+    assert calls == [("anthropic", {}), ("openai-codex", {})]
+
+
+def test_unavailable_pool_falls_back_to_singleton_without_retrying_pool_token():
+    entry = _pool_entry("active", "primary", "pool-token", 0)
+    calls = []
+
+    class BrokenPool:
+        def entries(self):
+            raise RuntimeError(CANARY)
+
+        def peek(self):
+            return entry
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(load_pool=lambda provider: BrokenPool())
+        if name == "agent.account_usage":
+            def fetch(provider, **kwargs):
+                calls.append((provider, kwargs))
+                return {"plan": "Pro", "windows": [{"label": "primary", "used_percent": 5, "reset_at": NOW}]}
+            return SimpleNamespace(fetch_account_usage=fetch)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import):
+        source = asyncio.run(plugin_api._collect_usage_provider("openai-codex"))
+
+    assert source["pool_size"] == 0
+    assert calls == [("openai-codex", {})]
+
+
+def test_deepseek_key_source_is_reported_without_key_and_missing_key_is_unavailable():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _write_env(root / "profiles" / "alpha" / ".env", "deepseek-secret-value")
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+            key, source = plugin_api._read_deepseek_credential()
+        assert key == "deepseek-secret-value"
+        assert source == "alpha"
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), patch.object(
+            plugin_api.urllib.request, "urlopen", return_value=_FakeResponse(
+                b'{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"2"}]}'
+            )
+        ):
+            sources = asyncio.run(plugin_api._collect_quota_sources())
+        deepseek = plugin_api.build_quotas_response(sources, now=NOW)["providers"][2]
+        assert deepseek["key_source"] == "alpha"
+        assert deepseek["accounts"][0]["active"] is True
+        assert "deepseek-secret-value" not in json.dumps(deepseek)
+
+    with tempfile.TemporaryDirectory() as directory, patch.dict(
+        os.environ, {"HERMES_HOME": directory}, clear=True
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+    deepseek = plugin_api.build_quotas_response(sources, now=NOW)["providers"][2]
+    assert deepseek["status"] == "n/a"
+    assert deepseek["key_source"] is None
+
+
+def test_deepseek_key_source_never_exposes_key_from_unsafe_profile_name():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        key = "credential-like-canary"
+        _write_env(root / "profiles" / key / ".env", key)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+            resolved_key, source = plugin_api._read_deepseek_credential()
+
+    assert resolved_key == key
+    assert source == "profile"
+    assert key not in source
+
+
+def test_pool_labels_never_expose_email_or_token_in_response_or_logs():
+    runtime_token = "sensitive-runtime-token"
+    access_token = "sensitive-access-token"
+    foreign_token = "foreign-account-token"
+    entry = _pool_entry("unsafe", access_token, runtime_token, 0)
+    entry.access_token = access_token
+    foreign_entry = _pool_entry("foreign", f"backup-{runtime_token}", foreign_token, 1)
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(load_pool=lambda provider: _FakePool([entry, foreign_entry], entry))
+        if name == "agent.account_usage":
+            return SimpleNamespace(fetch_account_usage=lambda provider, api_key=None: {
+                "plan": "Plus",
+                "windows": [{"label": "primary", "used_percent": 1, "reset_at": NOW}],
+            })
+        raise AssertionError(name)
+
+    output = io.StringIO()
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_fetch_deepseek_balance", side_effect=RuntimeError(CANARY)
+    ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        result = plugin_api.build_quotas_response(asyncio.run(plugin_api._collect_quota_sources()), now=NOW)
+
+    serialized = json.dumps(result)
+    assert runtime_token not in serialized
+    assert access_token not in serialized
+    assert foreign_token not in serialized
+    assert CANARY not in serialized
+    assert runtime_token not in output.getvalue()
+    assert access_token not in output.getvalue()
+    assert foreign_token not in output.getvalue()
     assert CANARY not in output.getvalue()
 
 

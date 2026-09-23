@@ -257,7 +257,7 @@ function renderWorkerRow(w) {
 function WorkerChip({ ctx }) {
   const { data, error, refreshFresh, close } = useMonitor(ctx, '/workers', WORKER_INTERVAL_MS)
 
-  const workers = Array.isArray(data?.workers) ? data.workers : []
+  const workers = (Array.isArray(data?.workers) ? data.workers : []).filter(w => w && typeof w === 'object')
   const count = Number.isFinite(data?.count) ? data.count : workers.length
   const color = count > 0 ? STATE_COLOR[worstWorkerState(workers)] : null
   // The Kanban link comes from the first worker only; if it has no URL we omit
@@ -398,37 +398,70 @@ function renderWindowBar(win) {
   }, win.label)
 }
 
+/** Footer-only view of the ACTIVE account label, capped to the statusbar budget. */
+function footerAccountLabel(p) {
+  const label = typeof p?.account_label === 'string' ? p.account_label.trim() : ''
+  if (!label) return null
+  // Credential-pool labels can be long; the click menu always shows the full one.
+  return label.length > 18 ? `${label.slice(0, 17)}…` : label
+}
+
+function footerPoolSize(p) {
+  return Number.isFinite(p?.pool_size) ? Math.max(0, Math.floor(p.pool_size)) : 0
+}
+
 function renderProviderChip(p) {
   const nok = p.status !== 'ok'
   const windows = Array.isArray(p.windows) ? p.windows : []
-  // One bar per provider in the footer: Claude -> its 5h window only, Codex ->
-  // its primary window. Every window (with its reset hour) stays in the menu.
+  // One bar per provider in the footer, for the ACTIVE account only (top-level
+  // fields): Claude -> its 5h window, Codex -> its primary window. Every pool
+  // account, window and reset hour stays in the menu.
   const footerWindows = p.id === 'claude'
     ? windows.filter(win => String(win.label || '').trim().toLowerCase() === '5h').slice(0, 1)
     : windows.slice(0, 1)
+  const accountLabel = footerAccountLabel(p)
+  const poolSize = footerPoolSize(p)
   const value = nok
     ? jsx('span', {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
         style: { whiteSpace: 'nowrap', lineHeight: 1 },
         children: 'n/a'
-      })
+      }, 'value')
     : p.id === 'deepseek'
       ? jsx('span', {
           className: 'font-medium tabular-nums text-(--ui-text-secondary)',
           style: { whiteSpace: 'nowrap', lineHeight: 1 },
           children: formatBalance(p.balance)
-        })
+        }, 'value')
       : footerWindows.length > 0
         ? jsxs('span', {
             className: 'inline-flex items-center gap-2',
             style: { ...FOOTER_ROW, gap: '0.5rem', flex: '0 0 auto' },
             children: footerWindows.map(renderWindowBar)
-          })
+          }, 'value')
         : jsx('span', {
             className: 'text-[0.625rem] text-(--ui-text-quaternary)',
             style: { whiteSpace: 'nowrap', lineHeight: 1 },
             children: 'n/a'
-          })
+          }, 'value')
+
+  // Which account Hermes is using, right next to the provider name. Kept on the
+  // same flex row as everything else: no wrap, no clipping, no extra bar.
+  const labelNodes = []
+  if (accountLabel) {
+    labelNodes.push(jsx('span', {
+      className: 'text-[0.625rem] font-medium text-(--ui-text-tertiary)',
+      style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
+      children: accountLabel
+    }, 'account'))
+  }
+  if (poolSize > 1) {
+    labelNodes.push(jsx('span', {
+      className: 'tabular-nums text-[0.625rem] text-(--ui-text-quaternary)',
+      style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
+      children: `×${poolSize}`
+    }, 'pool'))
+  }
 
   return jsxs('span', {
     className: 'inline-flex items-center',
@@ -438,87 +471,196 @@ function renderProviderChip(p) {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
         style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
         children: p.label || p.id
-      }),
+      }, 'name'),
+      ...labelNodes,
       value
     ]
   }, p.id)
 }
 
-function renderWindowDetail(win) {
+function renderWindowDetail(win, key) {
+  const hasPct = Number.isFinite(win.used_percent)
   const pct = clampPct(win.used_percent)
   return jsxs('div', {
     className: 'w-full',
-    style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%' },
+    style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%', paddingLeft: '0.875rem' },
     children: [
       jsx('span', {
         className: 'text-(--ui-text-quaternary)',
         style: { width: '4rem', flex: '0 0 4rem' },
-        children: win.label
-      }),
+        children: win.label || '—'
+      }, 'label'),
       jsx('span', {
         className: 'overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
         style: { height: '0.5rem', minWidth: '5rem', flex: '1 1 auto' },
-        children: jsx('span', {
-          className: 'block h-full rounded-sm',
-          style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
-        })
-      }),
+        children: hasPct
+          ? jsx('span', {
+              className: 'block h-full rounded-sm',
+              style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
+            })
+          : null
+      }, 'bar'),
       jsx('span', {
         className: 'text-right tabular-nums text-(--ui-text-secondary)',
         style: { width: '2.5rem', flex: '0 0 2.5rem' },
-        children: `${Math.round(win.used_percent)}%`
-      }),
+        children: hasPct ? `${Math.round(pct)}%` : 'n/a'
+      }, 'pct'),
       jsx('span', {
         className: 'text-right text-(--ui-text-quaternary)',
         style: { width: '4.5rem', flex: '0 0 4.5rem' },
         children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/a'
-      })
+      }, 'reset')
     ]
-  }, win.label)
+  }, key)
 }
 
-function renderProviderDetail(p) {
-  const nok = p.status !== 'ok'
-  const details =
-    nok
-      ? []
-      : p.id === 'deepseek'
-        ? [
-            jsxs('div', {
-              className: 'flex w-full items-center gap-2',
-              children: [
-                jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Remaining balance' }),
-                jsx('span', {
-                  className: 'ml-auto font-medium tabular-nums text-(--ui-text-secondary)',
-                  children: formatBalance(p.balance)
-                })
-              ]
-            })
-          ]
-        : (Array.isArray(p.windows) ? p.windows : []).map(renderWindowDetail)
+/** One pool account normalized for the menu; never throws on missing fields. */
+function accountView(account, index) {
+  const a = account && typeof account === 'object' ? account : {}
+  const raw = typeof a.account_label === 'string' ? a.account_label.trim() : ''
+  const plan = typeof a.plan === 'string' ? a.plan.trim() : ''
+  return {
+    label: raw || `account ${index + 1}`,
+    plan: plan || null,
+    active: a.active === true,
+    ok: a.status === 'ok',
+    windows: Array.isArray(a.windows) ? a.windows : [],
+    balance: a.balance
+  }
+}
+
+/**
+ * Menu rows come from `accounts` (pool order). Without that field — old backend
+ * or an empty pool — fall back to the top-level fields, i.e. the active account.
+ */
+function poolAccounts(p) {
+  const accounts = Array.isArray(p?.accounts) ? p.accounts : []
+  if (accounts.length > 0) return accounts
+  return [{
+    account_label: p?.account_label,
+    plan: p?.plan,
+    active: true,
+    status: p?.status,
+    windows: p?.windows,
+    balance: p?.balance
+  }]
+}
+
+function renderProviderHeader(p) {
+  const poolSize = footerPoolSize(p)
+  const keySource =
+    p.id === 'deepseek' && typeof p.key_source === 'string' && p.key_source.trim() ? p.key_source.trim() : null
+  return jsxs('div', {
+    className: 'px-2 pt-1 pb-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
+    style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%' },
+    children: [
+      jsx('span', { children: p.label || p.id }, 'label'),
+      poolSize > 1 ? jsx('span', { className: 'tabular-nums', children: `${poolSize} accounts` }, 'pool') : null,
+      // Only the source NAME ("env", "root", a profile folder), never the key.
+      keySource
+        ? jsx('span', {
+            className: 'ml-auto',
+            style: { textTransform: 'none', letterSpacing: 'normal' },
+            children: `key: ${keySource}`
+          }, 'key')
+        : null
+    ]
+  }, `hdr-${p.id}`)
+}
+
+function renderAccountRow(p, raw, index) {
+  const account = accountView(raw, index)
+  const header = jsxs('div', {
+    style: { ...FOOTER_ROW, display: 'flex', gap: '0.375rem', width: '100%' },
+    children: [
+      jsx('span', {
+        className: account.active ? 'text-[0.625rem]' : 'text-[0.625rem] text-(--ui-text-quaternary)',
+        style: {
+          color: account.active ? GREEN : undefined,
+          width: '0.75rem',
+          flex: '0 0 0.75rem',
+          lineHeight: 1,
+          textAlign: 'center'
+        },
+        children: account.active ? '●' : '○'
+      }, 'dot'),
+      jsx('span', {
+        className: account.active ? 'font-medium text-(--ui-text-secondary)' : 'text-(--ui-text-quaternary)',
+        style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+        children: account.label
+      }, 'label'),
+      account.plan
+        ? jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+            children: `plan ${account.plan}`
+          }, 'plan')
+        : null,
+      account.active
+        ? jsx('span', {
+            className: 'ml-auto text-[0.625rem] font-medium',
+            style: { color: GREEN, lineHeight: 1.3, whiteSpace: 'nowrap' },
+            children: 'active'
+          }, 'active')
+        : null
+    ]
+  })
+
+  const lines = []
+  if (!account.ok) {
+    lines.push(
+      jsx('div', {
+        className: 'text-(--ui-text-quaternary)',
+        style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
+        children: 'n/a'
+      }, 'nok')
+    )
+  } else if (p.id === 'deepseek') {
+    lines.push(
+      jsxs('div', {
+        className: 'flex w-full items-center gap-2',
+        style: { paddingLeft: '0.875rem' },
+        children: [
+          jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Remaining balance' }, 'cap'),
+          jsx('span', {
+            className: 'ml-auto font-medium tabular-nums text-(--ui-text-secondary)',
+            children: formatBalance(account.balance)
+          }, 'amount')
+        ]
+      }, 'balance')
+    )
+  } else if (account.windows.length > 0) {
+    account.windows.forEach((win, wi) => lines.push(renderWindowDetail(win, `${p.id}-${index}-${wi}`)))
+  } else {
+    lines.push(
+      jsx('div', {
+        className: 'text-(--ui-text-quaternary)',
+        style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
+        children: 'n/a'
+      }, 'empty')
+    )
+  }
 
   return jsx(DropdownMenuItem, {
     onSelect: event => event.preventDefault(),
     children: jsxs('div', {
       className: 'flex w-full flex-col gap-1',
-      children: [
-        jsxs('div', {
-          className: 'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2',
-          children: [
-            jsx('span', { className: 'font-medium text-(--ui-text-secondary)', children: p.label || p.id }),
-            nok ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'n/a' }) : null
-          ]
-        }),
-        ...details
-      ]
+      children: [header, ...lines]
     })
-  }, p.id)
+  }, `${p.id}-${index}`)
+}
+
+/** Provider header + one row per pool account (empty pool -> active account only). */
+function renderProviderDetail(p) {
+  const nodes = [renderProviderHeader(p)]
+  poolAccounts(p).forEach((account, index) => nodes.push(renderAccountRow(p, account, index)))
+  return nodes
 }
 
 function QuoteChip({ ctx }) {
   const { data, error, refreshFresh, close } = useMonitor(ctx, '/quotas', QUOTA_INTERVAL_MS)
 
-  const providers = Array.isArray(data?.providers) ? data.providers : []
+  const providers = (Array.isArray(data?.providers) ? data.providers : []).filter(p => p && typeof p === 'object')
 
   const handleOpenChange = open => (open ? refreshFresh() : close())
 
@@ -548,7 +690,8 @@ function QuoteChip({ ctx }) {
   const menuChildren = []
   providers.forEach((p, i) => {
     if (i > 0) menuChildren.push(jsx(DropdownMenuSeparator, {}, `sep-${p.id}`))
-    menuChildren.push(renderProviderDetail(p))
+    // Provider header + one row per pool account.
+    menuChildren.push(...renderProviderDetail(p))
   })
   if (menuChildren.length === 0) {
     menuChildren.push(

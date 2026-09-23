@@ -30,7 +30,11 @@ def _deepseek_snapshot():
 
 def _provider(sources, provider_id):
     result = build_quotas_response(sources, now=NOW)
-    return next(provider for provider in result["providers"] if provider["id"] == provider_id)
+    provider = next(provider for provider in result["providers"] if provider["id"] == provider_id)
+    keys = {"id", "label", "status", "windows"}
+    if provider_id == "deepseek":
+        keys.add("balance")
+    return {key: provider[key] for key in keys}
 
 
 def test_quota_response_has_exact_provider_order_and_shape():
@@ -42,20 +46,14 @@ def test_quota_response_has_exact_provider_order_and_shape():
 
     result = build_quotas_response(sources, now=NOW)
 
-    assert result == {
-        "generated_at": NOW,
-        "providers": [
-            {"id": "claude", "label": "Claude", "status": "ok", "windows": [
-                {"label": "5h", "used_percent": 12.5, "reset_at": NOW + 10},
-                {"label": "week", "used_percent": 33.0, "reset_at": None},
-            ]},
-            {"id": "codex", "label": "Codex", "status": "ok", "windows": [
-                {"label": "5 hour", "used_percent": 40.0, "reset_at": NOW + 20},
-            ]},
-            {"id": "deepseek", "label": "DeepSeek", "status": "ok",
-             "balance": {"currency": "USD", "amount": 7.25}, "windows": []},
-        ],
-    }
+    assert result["generated_at"] == NOW
+    assert [provider["id"] for provider in result["providers"]] == ["claude", "codex", "deepseek"]
+    assert [provider["status"] for provider in result["providers"]] == ["ok", "ok", "ok"]
+    assert all(set(provider) >= {"account_label", "plan", "pool_size", "accounts"} for provider in result["providers"])
+    assert all(set(provider["accounts"][0]) == {
+        "account_label", "plan", "active", "status", "windows", "balance"
+    } for provider in result["providers"])
+    assert result["providers"][2]["key_source"] is None
     assert CANARY not in json.dumps(result)
 
 
@@ -144,14 +142,10 @@ def test_each_failed_or_malformed_source_degrades_independently():
         {"anthropic": RuntimeError(CANARY), "openai-codex": None, "deepseek": {"error": CANARY}},
         now=NOW,
     )
-    assert result == {
-        "generated_at": NOW,
-        "providers": [
-            {"id": "claude", "label": "Claude", "status": "n/a", "windows": []},
-            {"id": "codex", "label": "Codex", "status": "n/a", "windows": []},
-            {"id": "deepseek", "label": "DeepSeek", "status": "n/a", "balance": None, "windows": []},
-        ],
-    }
+    assert result["generated_at"] == NOW
+    assert [provider["id"] for provider in result["providers"]] == ["claude", "codex", "deepseek"]
+    assert [provider["status"] for provider in result["providers"]] == ["n/a", "n/a", "n/a"]
+    assert all(provider["accounts"][0]["status"] == "n/a" for provider in result["providers"])
     assert CANARY not in json.dumps(result)
 
 

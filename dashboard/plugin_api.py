@@ -11,6 +11,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.request
@@ -166,11 +167,62 @@ def _active_pool_token(provider: str) -> str | None:
     return getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None) if entry else None
 
 
-def _fetch_account_usage(provider: str) -> Any:
+def _fetch_account_usage(provider: str, api_key: str | None = None, use_pool: bool = True) -> Any:
     module = importlib.import_module("agent.account_usage")
-    token = _active_pool_token(provider) if provider == "openai-codex" else None
+    token = api_key or (_active_pool_token(provider) if use_pool else None)
     result = module.fetch_account_usage(provider, api_key=token) if token else module.fetch_account_usage(provider)
     return asyncio.run(result) if inspect.isawaitable(result) else result
+
+
+def _entry_token(entry: Any) -> str | None:
+    return getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None)
+
+
+def _safe_account_label(entry: Any, index: int, secrets: tuple[str, ...]) -> str:
+    label = str(getattr(entry, "label", "") or "").strip()
+    if not label or "@" in label or any(secret in label for secret in secrets):
+        return f"account {index + 1}"
+    return label[:80]
+
+
+async def _collect_usage_provider(provider: str) -> dict[str, Any]:
+    try:
+        pool = importlib.import_module("agent.credential_pool").load_pool(provider)
+        entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0))
+        active = pool.peek()
+    except Exception:
+        entries, active = [], None
+
+    if not entries:
+        source = await _limited_call(_fetch_account_usage, provider, None, False)
+        return {
+            "pool_size": 0,
+            "accounts": [{"account_label": "default", "active": True, "source": source}],
+        }
+
+    active_id = getattr(active, "id", None)
+    secrets = tuple(
+        secret
+        for entry in entries
+        for secret in (getattr(entry, "runtime_api_key", None), getattr(entry, "access_token", None))
+        if isinstance(secret, str) and secret
+    )
+    calls = []
+    for entry in entries:
+        token = _entry_token(entry)
+        calls.append(_limited_call(_fetch_account_usage, provider, token, False) if token else asyncio.sleep(0, result=None))
+    snapshots = await asyncio.gather(*calls)
+    return {
+        "pool_size": len(entries),
+        "accounts": [
+            {
+                "account_label": _safe_account_label(entry, index, secrets),
+                "active": bool(active is entry or (active_id is not None and getattr(entry, "id", None) == active_id)),
+                "source": snapshots[index],
+            }
+            for index, entry in enumerate(entries)
+        ],
+    }
 
 
 def _read_env_key(path: Path, name: str) -> str | None:
@@ -187,29 +239,42 @@ def _read_env_key(path: Path, name: str) -> str | None:
     return None
 
 
-def _read_deepseek_key() -> str | None:
+def _read_deepseek_credential() -> tuple[str | None, str | None]:
     environment_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if environment_key:
-        return environment_key
+        return environment_key, "env"
 
     root = _hermes_home()
     root_key = _read_env_key(root / ".env", "DEEPSEEK_API_KEY")
     if root_key:
-        return root_key
+        return root_key, "root"
 
     try:
         profile_envs = sorted((root / "profiles").glob("*/.env"), key=lambda path: path.parent.name)
     except OSError:
-        return None
+        return None, None
     for path in profile_envs:
         profile_key = _read_env_key(path, "DEEPSEEK_API_KEY")
         if profile_key:
-            return profile_key
-    return None
+            profile = path.parent.name
+            safe_profile = (
+                profile
+                if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", profile)
+                and "@" not in profile
+                and profile_key not in profile
+                and profile not in profile_key
+                else "profile"
+            )
+            return profile_key, safe_profile
+    return None, None
 
 
-def _fetch_deepseek_balance() -> Any:
-    key = _read_deepseek_key()
+def _read_deepseek_key() -> str | None:
+    return _read_deepseek_credential()[0]
+
+
+def _fetch_deepseek_balance(key: str | None = None) -> Any:
+    key = key or _read_deepseek_key()
     if not key:
         raise RuntimeError("DeepSeek credentials unavailable")
     request = urllib.request.Request(
@@ -229,12 +294,21 @@ async def _limited_call(function: Callable[..., Any], *args: Any) -> Any:
 
 
 async def _collect_quota_sources() -> dict[str, Any]:
+    deepseek_key, deepseek_source = _read_deepseek_credential()
     anthropic, codex, deepseek = await asyncio.gather(
-        _limited_call(_fetch_account_usage, "anthropic"),
-        _limited_call(_fetch_account_usage, "openai-codex"),
-        _limited_call(_fetch_deepseek_balance),
+        _collect_usage_provider("anthropic"),
+        _collect_usage_provider("openai-codex"),
+        _limited_call(_fetch_deepseek_balance, deepseek_key) if deepseek_key else _limited_call(_fetch_deepseek_balance),
     )
-    return {"anthropic": anthropic, "openai-codex": codex, "deepseek": deepseek}
+    return {
+        "anthropic": anthropic,
+        "openai-codex": codex,
+        "deepseek": {
+            "pool_size": 1 if deepseek_key else 0,
+            "key_source": deepseek_source,
+            "accounts": [{"account_label": "default", "active": True, "source": deepseek}],
+        },
+    }
 
 
 async def _cached(cache: TTLCache, lock: asyncio.Lock, fresh: int, builder: Callable[[], Any]) -> dict[str, Any]:

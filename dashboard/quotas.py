@@ -81,9 +81,57 @@ def _deepseek(source: Any) -> dict[str, Any]:
     return {"id": "deepseek", "label": "DeepSeek", "status": "ok", "balance": {"currency": currency, "amount": amount}, "windows": []}
 
 
+def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
+    metadata = raw if isinstance(raw, Mapping) and "source" in raw else {"source": raw, "account_label": "default", "active": True}
+    source = metadata.get("source")
+    normalized = transform(source)
+    label = metadata.get("account_label")
+    if not isinstance(label, str) or not label.strip() or "@" in label:
+        label = f"account {index + 1}"
+    plan = _value(source, "plan")
+    if not isinstance(plan, str) or "@" in plan or len(plan) > 80:
+        plan = None
+    return {
+        "account_label": label,
+        "plan": plan,
+        "active": bool(metadata.get("active")),
+        "status": normalized["status"],
+        "windows": normalized.get("windows", []),
+        "balance": normalized.get("balance"),
+    }
+
+
+def _provider(source: Any, transform: Any, *, key_source: bool = False) -> dict[str, Any]:
+    envelope = source if isinstance(source, Mapping) and isinstance(source.get("accounts"), list) else None
+    raw_accounts = envelope["accounts"] if envelope is not None else [source]
+    accounts = [_account(raw, transform, index) for index, raw in enumerate(raw_accounts)]
+    active = next((account for account in accounts if account["active"]), None)
+    identity = transform(None)
+    result = {
+        "id": identity["id"],
+        "label": identity["label"],
+        "status": active["status"] if active else "n/a",
+        "account_label": active["account_label"] if active else None,
+        "plan": active["plan"] if active else None,
+        "pool_size": int(envelope.get("pool_size", 0)) if envelope is not None else 0,
+        "windows": active["windows"] if active else [],
+        "accounts": accounts,
+    }
+    if identity["id"] == "deepseek":
+        result["balance"] = active["balance"] if active else None
+    if key_source:
+        source_name = envelope.get("key_source") if envelope is not None else None
+        result["key_source"] = source_name if isinstance(source_name, str) and "@" not in source_name else None
+    return result
+
+
 def build_quotas_response(sources: Mapping[str, Any], *, now: int) -> dict[str, Any]:
     """Build the fixed public provider payload, dropping all source extras."""
     return {
         "generated_at": int(now),
-        "providers": [_claude(sources.get("anthropic")), _codex(sources.get("openai-codex")), _deepseek(sources.get("deepseek"))],
+        "providers": [
+            _provider(sources.get("anthropic"), _claude),
+            _provider(sources.get("openai-codex"), _codex),
+            _provider(sources.get("deepseek"), _deepseek, key_source=True),
+        ],
     }
