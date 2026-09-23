@@ -45,8 +45,9 @@ def _claude(source: Any) -> dict[str, Any]:
     if source is None or isinstance(source, BaseException):
         return {"id": "claude", "label": "Claude", "status": "n/d", "windows": []}
     indexed = {str(_value(item, "label", "")).lower().replace("-", "_").replace(" ", "_"): item for item in _windows(source)}
-    five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h"}), None)
-    week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly"}), None)
+    # agent.account_usage labels Claude windows "Current session" (five_hour) and "Current week" (seven_day)
+    five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h", "current_session", "session"}), None)
+    week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly", "current_week"}), None)
     normalized = [_window(five, "5h"), _window(week, "settimana")]
     if any(item is None for item in normalized):
         return {"id": "claude", "label": "Claude", "status": "n/d", "windows": []}

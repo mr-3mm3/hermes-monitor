@@ -23,9 +23,18 @@ from fastapi import APIRouter, Query
 try:
     from .quotas import build_quotas_response
     from .workers import build_workers_response, hash_arguments
-except ImportError:  # Loaded directly by the Hermes plugin loader.
-    from quotas import build_quotas_response
-    from workers import build_workers_response, hash_arguments
+except ImportError:  # Loaded by file path by the Hermes plugin loader: no package, no sys.path entry.
+    import importlib.util as _ilu
+
+    def _load_sibling(name: str) -> Any:
+        spec = _ilu.spec_from_file_location(f"hermes_monitor_{name}", Path(__file__).with_name(f"{name}.py"))
+        module = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    build_quotas_response = _load_sibling("quotas").build_quotas_response
+    _workers = _load_sibling("workers")
+    build_workers_response, hash_arguments = _workers.build_workers_response, _workers.hash_arguments
 
 
 router = APIRouter()
