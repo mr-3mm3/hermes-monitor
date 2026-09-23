@@ -1,6 +1,9 @@
 import asyncio
 import json
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from dashboard import plugin_api
@@ -13,6 +16,20 @@ SECRET = "fake-secret-never-return"
 def test_routes_are_relative_and_registered():
     paths = {route.path for route in plugin_api.router.routes}
     assert paths == {"/workers", "/quotas"}
+
+
+def test_sqlite_connections_are_enforced_read_only():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "state.db"
+        with sqlite3.connect(path) as writable:
+            writable.execute("CREATE TABLE sample (value TEXT)")
+        with plugin_api._readonly_connection(path) as readonly:
+            try:
+                readonly.execute("INSERT INTO sample VALUES ('forbidden')")
+            except sqlite3.OperationalError as error:
+                assert "readonly" in str(error).lower()
+            else:
+                raise AssertionError("read-only connection unexpectedly accepted a write")
 
 
 def test_workers_endpoint_exact_shape_and_fresh_bypasses_cache():
