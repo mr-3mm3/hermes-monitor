@@ -32,4 +32,4 @@ All 11 specified tests pass. No live provider or network calls are made in tests
 
 ## Merge evidence
 
-Checkpoint `53bab9a` contains the behavior specifications; checkpoint `68afac7` contains the GREEN implementation.
+Checkpoint `53bab9a` contains the behavior specifications; checkpoint `68afac7` contains the GREEN implementation; checkpoint `f4e1f8d` keeps the latest 200 worker events in chronological order and preserves GREEN.
