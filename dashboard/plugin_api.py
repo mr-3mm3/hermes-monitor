@@ -158,18 +158,38 @@ def _fetch_account_usage(provider: str) -> Any:
     return asyncio.run(result) if inspect.isawaitable(result) else result
 
 
-def _read_deepseek_key() -> str | None:
-    path = _hermes_home() / "profiles" / "coder-deepseek" / ".env"
+def _read_env_key(path: Path, name: str) -> str | None:
     try:
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            name, value = line.split("=", 1)
-            if name.strip() == "DEEPSEEK_API_KEY":
+            candidate, value = line.split("=", 1)
+            if candidate.strip() == name:
                 return value.strip().strip("\"'") or None
     except OSError:
         return None
+    return None
+
+
+def _read_deepseek_key() -> str | None:
+    environment_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if environment_key:
+        return environment_key
+
+    root = _hermes_home()
+    root_key = _read_env_key(root / ".env", "DEEPSEEK_API_KEY")
+    if root_key:
+        return root_key
+
+    try:
+        profile_envs = sorted((root / "profiles").glob("*/.env"), key=lambda path: path.parent.name)
+    except OSError:
+        return None
+    for path in profile_envs:
+        profile_key = _read_env_key(path, "DEEPSEEK_API_KEY")
+        if profile_key:
+            return profile_key
     return None
 
 
