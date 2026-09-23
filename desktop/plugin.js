@@ -32,7 +32,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
   icons,
-  useQuery
+  useQuery,
+  useQueryClient
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -116,9 +117,9 @@ function worstWorkerState(workers) {
 
 /**
  * Polls `path` at `intervalMs` through React Query (cached backend path), and
- * exposes `refreshFresh()` to re-fetch with `?fresh=1` while the menu is open.
- * `data` prefers the fresh snapshot while the menu is open, then falls back to
- * the polled value once closed.
+ * exposes `refreshFresh()` to re-fetch with `?fresh=1` when the menu opens.
+ * A successful click refresh replaces the same query cache entry consumed by
+ * the footer and menu, keeping both views on one shared snapshot.
  *
  * A failed request — poll or fresh — never leaves stale numbers on screen:
  * React Query keeps the last successful `data` across a failed refetch, so the
@@ -126,16 +127,21 @@ function worstWorkerState(workers) {
  * chips render their "n/a" / inactive state. Rejections stay contained here.
  */
 function useMonitor(ctx, path, intervalMs) {
+  const queryClient = useQueryClient()
+  const queryKey = [ID, path]
   const query = useQuery({
-    queryKey: [ID, path],
+    queryKey,
     queryFn: () => ctx.rest(path),
     refetchInterval: intervalMs,
     retry: false
   })
 
-  const [fresh, setFresh] = useState(null)
   const [freshFailed, setFreshFailed] = useState(false)
   const openRef = useRef(false)
+
+  useEffect(() => () => {
+    openRef.current = false
+  }, [])
 
   // A successful poll supersedes a previous fresh-fetch failure, so the chip
   // returns to live data on its own.
@@ -150,33 +156,31 @@ function useMonitor(ctx, path, intervalMs) {
       request = ctx.rest(`${path}?fresh=1`)
     } catch {
       // Bridge threw synchronously: same neutral outcome as a rejection.
-      setFresh(null)
       setFreshFailed(true)
       return
     }
     Promise.resolve(request)
       .then(data => {
-        if (!openRef.current) return
-        setFresh(data)
-        setFreshFailed(false)
+        // Replace the polling snapshot in the shared cache so the footer and
+        // open menu always render the same response.
+        queryClient.setQueryData([ID, path], data)
+        if (openRef.current) setFreshFailed(false)
       })
       .catch(() => {
         if (!openRef.current) return
-        setFresh(null)
         setFreshFailed(true)
       })
-  }, [ctx, path])
+  }, [ctx, path, queryClient])
 
   const close = useCallback(() => {
     openRef.current = false
-    setFresh(null)
     setFreshFailed(false)
   }, [])
 
   // `isRefetchError` covers the v5 background-refetch failure that keeps the
   // previous `data` around with `status: 'error'`.
   const failed = query.isError === true || query.isRefetchError === true || freshFailed
-  const data = failed ? null : fresh ?? query.data
+  const data = failed ? null : query.data
 
   return { data, error: failed, refreshFresh, close }
 }
@@ -203,10 +207,10 @@ function renderWorkerRow(w) {
   return jsx(DropdownMenuItem, {
     onSelect: event => event.preventDefault(),
     children: jsxs('div', {
-      className: 'flex w-full flex-col gap-0.5',
+      className: 'flex w-full min-w-0 flex-col gap-1',
       children: [
         jsxs('div', {
-          className: 'flex w-full items-center gap-1.5',
+          className: 'grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2',
           children: [
             jsx('span', {
               className: 'size-1.5 shrink-0 rounded-full',
@@ -223,10 +227,9 @@ function renderWorkerRow(w) {
           ]
         }),
         jsxs('div', {
-          className: 'flex w-full items-center gap-1 text-[0.625rem] text-(--ui-text-quaternary)',
+          className: 'grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 pl-3.5 text-[0.625rem] text-(--ui-text-quaternary)',
           children: [
             jsx('span', { className: 'shrink-0 font-mono', children: w.card_id || '—' }),
-            jsx('span', { children: '·' }),
             jsx('span', { className: 'min-w-0 flex-1 truncate', children: w.assignee || '—' }),
             jsx('span', { className: 'shrink-0', children: `last activity ${formatLastActivity(w.last_activity_s)}` })
           ]
@@ -320,6 +323,7 @@ function WorkerChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
+        className: 'min-w-72',
         children: menuChildren
       })
     ]
@@ -333,14 +337,14 @@ function renderWindowBar(win) {
   const hasPct = Number.isFinite(win.used_percent)
   const pct = clampPct(win.used_percent)
   return jsxs('span', {
-    className: 'inline-flex items-center gap-1',
+    className: 'inline-grid grid-cols-[auto_1.75rem_2.25rem_auto] items-center gap-x-1',
     children: [
       jsx('span', {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
         children: win.label || '—'
       }),
       jsx('span', {
-        className: 'relative block h-1.5 w-5 shrink-0 overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        className: 'relative block h-2 w-7 shrink-0 overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
         children: hasPct
           ? jsx('span', {
               className: 'absolute inset-y-0 left-0 rounded-sm',
@@ -363,6 +367,9 @@ function renderWindowBar(win) {
 function renderProviderChip(p) {
   const nok = p.status !== 'ok'
   const windows = Array.isArray(p.windows) ? p.windows : []
+  const footerWindows = p.id === 'claude'
+    ? windows.filter(win => String(win.label || '').toLowerCase() === '5h').slice(0, 1)
+    : windows
   const value = nok
     ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
     : p.id === 'deepseek'
@@ -370,15 +377,15 @@ function renderProviderChip(p) {
           className: 'font-medium tabular-nums text-(--ui-text-secondary)',
           children: formatBalance(p.balance)
         })
-      : windows.length > 0
+      : footerWindows.length > 0
         ? jsxs('span', {
-            className: 'inline-flex items-center gap-1.5',
-            children: windows.map(renderWindowBar)
+            className: 'inline-flex items-center gap-2',
+            children: footerWindows.map(renderWindowBar)
           })
         : jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: 'n/a' })
 
   return jsxs('span', {
-    className: 'inline-flex items-center gap-1',
+    className: 'inline-grid grid-cols-[auto_auto] items-center gap-x-1.5',
     children: [
       jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: p.label || p.id }),
       value
@@ -389,22 +396,22 @@ function renderProviderChip(p) {
 function renderWindowDetail(win) {
   const pct = clampPct(win.used_percent)
   return jsxs('div', {
-    className: 'flex w-full items-center gap-2',
+    className: 'grid w-full grid-cols-[4rem_minmax(5rem,1fr)_2.5rem_4.5rem] items-center gap-x-2',
     children: [
       jsx('span', { className: 'w-16 shrink-0 text-(--ui-text-quaternary)', children: win.label }),
       jsx('span', {
-        className: 'h-1.5 flex-1 overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
+        className: 'h-2 w-full overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
         children: jsx('span', {
           className: 'block h-full rounded-sm',
           style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
         })
       }),
       jsx('span', {
-        className: 'w-10 shrink-0 text-right tabular-nums text-(--ui-text-secondary)',
+        className: 'text-right tabular-nums text-(--ui-text-secondary)',
         children: `${Math.round(win.used_percent)}%`
       }),
       jsx('span', {
-        className: 'w-16 shrink-0 text-right text-(--ui-text-quaternary)',
+        className: 'text-right text-(--ui-text-quaternary)',
         children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/a'
       })
     ]
@@ -437,7 +444,7 @@ function renderProviderDetail(p) {
       className: 'flex w-full flex-col gap-1',
       children: [
         jsxs('div', {
-          className: 'flex w-full items-center gap-1.5',
+          className: 'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2',
           children: [
             jsx('span', { className: 'font-medium text-(--ui-text-secondary)', children: p.label || p.id }),
             nok ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'n/a' }) : null
@@ -500,6 +507,7 @@ function QuoteChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
+        className: 'min-w-80',
         children: menuChildren
       })
     ]
