@@ -153,9 +153,23 @@ def _build_workers_payload() -> dict[str, Any]:
     return build_workers_response(tasks, activity, now=now)
 
 
+def _active_pool_token(provider: str) -> str | None:
+    """Token of the credential Hermes will use next for *provider* (pool order), if any.
+
+    Without it the usage API reads the legacy singleton login, which is stale once the
+    user adds a second account and moves it to priority 0.
+    """
+    try:
+        entry = importlib.import_module("agent.credential_pool").load_pool(provider).peek()
+    except Exception:
+        return None
+    return getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None) if entry else None
+
+
 def _fetch_account_usage(provider: str) -> Any:
     module = importlib.import_module("agent.account_usage")
-    result = module.fetch_account_usage(provider)
+    token = _active_pool_token(provider) if provider == "openai-codex" else None
+    result = module.fetch_account_usage(provider, api_key=token) if token else module.fetch_account_usage(provider)
     return asyncio.run(result) if inspect.isawaitable(result) else result
 
 
