@@ -4,8 +4,10 @@
  * Two footer items (STATUSBAR_AREAS.right):
  *   1. Worker  — animated spinner + count of running kanban cards, colored by
  *                the worst worker state (loop > stalled > active).
- *   2. Quote   — per-provider mini usage bars (+ reset time, or DeepSeek
- *                balance), colored by usage threshold.
+ *   2. Quote   — one compact group per provider reported by the backend, with
+ *                its own usage bars / remaining balance, colored by threshold.
+ *                The provider set is dynamic (1..N): nothing here is keyed on a
+ *                provider id, the shape of each entry decides how it renders.
  *
  * Both poll their own backend namespace via `ctx.rest` (namespace-relative
  * paths only — see the plugin contract). Periodic polling never bypasses the
@@ -115,11 +117,31 @@ function formatLastActivity(sec) {
   return `${Math.floor(m / 60)}h ago`
 }
 
+/** Finite amount inside a `balance` object ({currency, amount}), else null. */
+function balanceAmount(balance) {
+  if (!balance || typeof balance !== 'object') return null
+  const raw = balance.amount
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null
+  if (typeof raw === 'string' && raw.trim() === '') return null
+  const amount = Number(raw)
+  return Number.isFinite(amount) ? amount : null
+}
+
 function formatBalance(balance) {
-  if (!balance || typeof balance.amount !== 'number') return 'n/a'
+  const amount = balanceAmount(balance)
+  if (amount === null) return 'n/a'
   const code = String(balance.currency || '').toUpperCase()
   const symbol = code === 'USD' ? '$' : code === 'EUR' ? '€' : code === 'CNY' ? '¥' : code ? `${code} ` : ''
-  return `${symbol}${balance.amount.toFixed(2)}`
+  return `${symbol}${amount.toFixed(2)}`
+}
+
+/**
+ * Provider/account status is "ok" | "n/a". Anything else (a legacy payload with
+ * no status field at all) counts as usable, so an older backend still renders
+ * its numbers instead of collapsing to "n/a".
+ */
+function statusOk(status) {
+  return status !== 'n/a'
 }
 
 function worstWorkerState(workers) {
@@ -410,40 +432,43 @@ function footerPoolSize(p) {
   return Number.isFinite(p?.pool_size) ? Math.max(0, Math.floor(p.pool_size)) : 0
 }
 
-function renderProviderChip(p) {
-  const nok = p.status !== 'ok'
-  const windows = Array.isArray(p.windows) ? p.windows : []
-  // One bar per provider in the footer, for the ACTIVE account only (top-level
-  // fields): Claude -> its 5h window, Codex -> its primary window. Every pool
-  // account, window and reset hour stays in the menu.
-  const footerWindows = p.id === 'claude'
-    ? windows.filter(win => String(win.label || '').trim().toLowerCase() === '5h').slice(0, 1)
-    : windows.slice(0, 1)
+/** "n/a" read-out shared by the footer chip and the menu rows. */
+function naValue(key) {
+  return jsx('span', {
+    className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+    style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
+    children: 'n/a'
+  }, key)
+}
+
+/**
+ * Footer view of ONE provider: name, active-account label, then the active
+ * account's headline figure. No provider id is special-cased — the shape of the
+ * payload decides: with `windows` the FIRST window is shown (Claude's 5h
+ * session, Codex's primary window), a provider without windows but with a
+ * `balance` shows the amount, an explicit "n/a" status (or nothing to show at
+ * all) renders "n/a". Every window, account and reset hour stays in the menu.
+ */
+function renderProviderChip(p, index) {
+  const windows = Array.isArray(p.windows) ? p.windows.filter(win => win && typeof win === 'object') : []
   const accountLabel = footerAccountLabel(p)
   const poolSize = footerPoolSize(p)
-  const value = nok
-    ? jsx('span', {
-        className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-        style: { whiteSpace: 'nowrap', lineHeight: 1 },
-        children: 'n/a'
-      }, 'value')
-    : p.id === 'deepseek'
-      ? jsx('span', {
-          className: 'font-medium tabular-nums text-(--ui-text-secondary)',
-          style: { whiteSpace: 'nowrap', lineHeight: 1 },
-          children: formatBalance(p.balance)
-        }, 'value')
-      : footerWindows.length > 0
-        ? jsxs('span', {
-            className: 'inline-flex items-center gap-2',
-            style: { ...FOOTER_ROW, gap: '0.5rem', flex: '0 0 auto' },
-            children: footerWindows.map(renderWindowBar)
-          }, 'value')
-        : jsx('span', {
-            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-            style: { whiteSpace: 'nowrap', lineHeight: 1 },
-            children: 'n/a'
-          }, 'value')
+  const hasBalance = balanceAmount(p.balance) !== null
+
+  let value
+  if (!statusOk(p.status)) {
+    value = naValue('value')
+  } else if (windows.length > 0) {
+    value = renderWindowBar(windows[0])
+  } else if (hasBalance) {
+    value = jsx('span', {
+      className: 'font-medium tabular-nums text-(--ui-text-secondary)',
+      style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
+      children: formatBalance(p.balance)
+    }, 'value')
+  } else {
+    value = naValue('value')
+  }
 
   // Which account Hermes is using, right next to the provider name. Kept on the
   // same flex row as everything else: no wrap, no clipping, no extra bar.
@@ -470,12 +495,27 @@ function renderProviderChip(p) {
       jsx('span', {
         className: 'text-[0.625rem] text-(--ui-text-quaternary)',
         style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
-        children: p.label || p.id
+        children: p.label || p.id || '—'
       }, 'name'),
       ...labelNodes,
       value
     ]
-  }, p.id)
+  }, `provider-${index}`)
+}
+
+/**
+ * Footer nodes: one group per provider, in payload order, separated by a middot.
+ * Built from whatever the backend returns — 1, 3 or N providers, no id list.
+ */
+function buildProviderChipNodes(providers) {
+  const nodes = []
+  providers.forEach((p, index) => {
+    if (index > 0) {
+      nodes.push(jsx('span', { className: 'px-0.5 text-(--ui-text-quaternary)', children: '·' }, `chip-sep-${index}`))
+    }
+    nodes.push(renderProviderChip(p, index))
+  })
+  return nodes
 }
 
 function renderWindowDetail(win, key) {
@@ -514,6 +554,30 @@ function renderWindowDetail(win, key) {
   }, key)
 }
 
+/** Menu line for a provider/account with nothing to show. */
+function naLine(key) {
+  return jsx('div', {
+    className: 'text-(--ui-text-quaternary)',
+    style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
+    children: 'n/a'
+  }, key)
+}
+
+/** Menu line for a provider/account whose figure is a currency balance. */
+function balanceLine(balance, key) {
+  return jsxs('div', {
+    className: 'flex w-full items-center gap-2',
+    style: { paddingLeft: '0.875rem' },
+    children: [
+      jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Remaining balance' }, 'cap'),
+      jsx('span', {
+        className: 'ml-auto font-medium tabular-nums text-(--ui-text-secondary)',
+        children: formatBalance(balance)
+      }, 'amount')
+    ]
+  }, key)
+}
+
 /** One pool account normalized for the menu; never throws on missing fields. */
 function accountView(account, index) {
   const a = account && typeof account === 'object' ? account : {}
@@ -523,8 +587,10 @@ function accountView(account, index) {
     label: raw || `account ${index + 1}`,
     plan: plan || null,
     active: a.active === true,
-    ok: a.status === 'ok',
-    windows: Array.isArray(a.windows) ? a.windows : [],
+    ok: statusOk(a.status),
+    // Non-object window entries are dropped here: a malformed payload must never
+    // throw while the statusbar is rendering.
+    windows: Array.isArray(a.windows) ? a.windows.filter(win => win && typeof win === 'object') : [],
     balance: a.balance
   }
 }
@@ -546,17 +612,22 @@ function poolAccounts(p) {
   }]
 }
 
-function renderProviderHeader(p) {
+/**
+ * Provider section header for the menu: display label, pool size, and — for
+ * key-based providers — the NAME of the source the key was read from. Nothing
+ * here is keyed on a provider id: `key_source` is rendered whenever the backend
+ * sends it, and only the source name ("env", a file, a profile folder) is
+ * shown, never the key itself.
+ */
+function renderProviderHeader(p, index) {
   const poolSize = footerPoolSize(p)
-  const keySource =
-    p.id === 'deepseek' && typeof p.key_source === 'string' && p.key_source.trim() ? p.key_source.trim() : null
+  const keySource = typeof p.key_source === 'string' && p.key_source.trim() ? p.key_source.trim() : null
   return jsxs('div', {
     className: 'px-2 pt-1 pb-0.5 text-[0.625rem] font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
     style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%' },
     children: [
-      jsx('span', { children: p.label || p.id }, 'label'),
+      jsx('span', { children: p.label || p.id || '—' }, 'label'),
       poolSize > 1 ? jsx('span', { className: 'tabular-nums', children: `${poolSize} accounts` }, 'pool') : null,
-      // Only the source NAME ("env", "root", a profile folder), never the key.
       keySource
         ? jsx('span', {
             className: 'ml-auto',
@@ -565,10 +636,10 @@ function renderProviderHeader(p) {
           }, 'key')
         : null
     ]
-  }, `hdr-${p.id}`)
+  }, `hdr-${index}`)
 }
 
-function renderAccountRow(p, raw, index) {
+function renderAccountRow(raw, index, providerIndex) {
   const account = accountView(raw, index)
   const header = jsxs('div', {
     style: { ...FOOTER_ROW, display: 'flex', gap: '0.375rem', width: '100%' },
@@ -604,41 +675,18 @@ function renderAccountRow(p, raw, index) {
           }, 'active')
         : null
     ]
-  })
+  }, 'header')
 
+  // Detail lines are chosen by what the account actually carries, never by the
+  // provider id: an unusable account renders a bare "n/a", otherwise every
+  // window is listed and a balance row is added when the payload has one.
   const lines = []
   if (!account.ok) {
-    lines.push(
-      jsx('div', {
-        className: 'text-(--ui-text-quaternary)',
-        style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
-        children: 'n/a'
-      }, 'nok')
-    )
-  } else if (p.id === 'deepseek') {
-    lines.push(
-      jsxs('div', {
-        className: 'flex w-full items-center gap-2',
-        style: { paddingLeft: '0.875rem' },
-        children: [
-          jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Remaining balance' }, 'cap'),
-          jsx('span', {
-            className: 'ml-auto font-medium tabular-nums text-(--ui-text-secondary)',
-            children: formatBalance(account.balance)
-          }, 'amount')
-        ]
-      }, 'balance')
-    )
-  } else if (account.windows.length > 0) {
-    account.windows.forEach((win, wi) => lines.push(renderWindowDetail(win, `${p.id}-${index}-${wi}`)))
+    lines.push(naLine('nok'))
   } else {
-    lines.push(
-      jsx('div', {
-        className: 'text-(--ui-text-quaternary)',
-        style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
-        children: 'n/a'
-      }, 'empty')
-    )
+    account.windows.forEach((win, wi) => lines.push(renderWindowDetail(win, `window-${wi}`)))
+    if (balanceAmount(account.balance) !== null) lines.push(balanceLine(account.balance, 'balance'))
+    if (lines.length === 0) lines.push(naLine('empty'))
   }
 
   return jsx(DropdownMenuItem, {
@@ -647,13 +695,29 @@ function renderAccountRow(p, raw, index) {
       className: 'flex w-full flex-col gap-1',
       children: [header, ...lines]
     })
-  }, `${p.id}-${index}`)
+  }, `account-${providerIndex ?? 0}-${index}`)
 }
 
 /** Provider header + one row per pool account (empty pool -> active account only). */
-function renderProviderDetail(p) {
-  const nodes = [renderProviderHeader(p)]
-  poolAccounts(p).forEach((account, index) => nodes.push(renderAccountRow(p, account, index)))
+function renderProviderDetail(p, index) {
+  const nodes = [renderProviderHeader(p, index)]
+  poolAccounts(p).forEach((account, accountIndex) =>
+    nodes.push(renderAccountRow(account, accountIndex, index))
+  )
+  return nodes
+}
+
+/**
+ * Menu nodes: one section per provider (header + one row per account), in
+ * payload order, separated by a rule. Length follows the backend, not a
+ * hardcoded provider list.
+ */
+function buildProviderMenuNodes(providers) {
+  const nodes = []
+  providers.forEach((p, index) => {
+    if (index > 0) nodes.push(jsx(DropdownMenuSeparator, {}, `menu-sep-${index}`))
+    nodes.push(...renderProviderDetail(p, index))
+  })
   return nodes
 }
 
@@ -664,15 +728,9 @@ function QuoteChip({ ctx }) {
 
   const handleOpenChange = open => (open ? refreshFresh() : close())
 
-  const chipNodes = []
-  providers.forEach((p, i) => {
-    if (i > 0) {
-      chipNodes.push(
-        jsx('span', { className: 'px-0.5 text-(--ui-text-quaternary)', children: '·' }, `chip-sep-${p.id}`)
-      )
-    }
-    chipNodes.push(renderProviderChip(p))
-  })
+  // Both views iterate the payload as it arrives: footer groups and menu
+  // sections are built from the same provider list, in the backend's order.
+  const chipNodes = buildProviderChipNodes(providers)
 
   const trigger = jsx(DropdownMenuTrigger, {
     asChild: true,
@@ -687,12 +745,7 @@ function QuoteChip({ ctx }) {
     })
   })
 
-  const menuChildren = []
-  providers.forEach((p, i) => {
-    if (i > 0) menuChildren.push(jsx(DropdownMenuSeparator, {}, `sep-${p.id}`))
-    // Provider header + one row per pool account.
-    menuChildren.push(...renderProviderDetail(p))
-  })
+  const menuChildren = buildProviderMenuNodes(providers)
   if (menuChildren.length === 0) {
     menuChildren.push(
       jsx('div', {

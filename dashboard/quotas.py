@@ -81,6 +81,16 @@ def _deepseek(source: Any) -> dict[str, Any]:
     return {"id": "deepseek", "label": "DeepSeek", "status": "ok", "balance": {"currency": currency, "amount": amount}, "windows": []}
 
 
+def _generic(source: Any, provider_id: str, label: str) -> dict[str, Any]:
+    unavailable = {"id": provider_id, "label": label, "status": "n/a", "windows": []}
+    if source is None or isinstance(source, BaseException):
+        return unavailable
+    normalized = [_window(item) for item in _windows(source)]
+    if not normalized or any(item is None for item in normalized):
+        return unavailable
+    return {"id": provider_id, "label": label, "status": "ok", "windows": normalized}
+
+
 def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
     metadata = raw if isinstance(raw, Mapping) and "source" in raw else {"source": raw, "account_label": "default", "active": True}
     source = metadata.get("source")
@@ -126,12 +136,30 @@ def _provider(source: Any, transform: Any, *, key_source: bool = False) -> dict[
 
 
 def build_quotas_response(sources: Mapping[str, Any], *, now: int) -> dict[str, Any]:
-    """Build the fixed public provider payload, dropping all source extras."""
+    """Build a secret-free payload for every active remote provider."""
+    known = {
+        "anthropic": (_claude, False),
+        "openai-codex": (_codex, False),
+        "deepseek": (_deepseek, True),
+    }
+    known_rank = {"anthropic": 0, "openai-codex": 1, "deepseek": 2}
+    providers = []
+    for provider_id in sorted(sources, key=lambda item: (known_rank.get(item, 3), item)):
+        source = sources.get(provider_id)
+        envelope = source if isinstance(source, Mapping) else {}
+        if provider_id in known:
+            transform, include_key_source = known[provider_id]
+        else:
+            raw_label = envelope.get("provider_label")
+            label = (
+                raw_label
+                if isinstance(raw_label, str) and raw_label.strip() and "@" not in raw_label
+                else provider_id.replace("-", " ").title()
+            )
+            transform = lambda value, item=provider_id, name=label[:80]: _generic(value, item, name)
+            include_key_source = False
+        providers.append(_provider(source, transform, key_source=include_key_source))
     return {
         "generated_at": int(now),
-        "providers": [
-            _provider(sources.get("anthropic"), _claude),
-            _provider(sources.get("openai-codex"), _codex),
-            _provider(sources.get("deepseek"), _deepseek, key_source=True),
-        ],
+        "providers": providers,
     }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed Claude quotas showing `n/a` for the active credential-pool account (OAuth token handling).
+- Quotas now dynamically enumerate every active Hermes provider instead of a hardcoded set (local-only providers are excluded).
+
 ## 0.2.0
 
 - Quotas now reflect each provider's active credential-pool account.

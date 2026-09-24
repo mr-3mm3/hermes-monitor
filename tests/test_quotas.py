@@ -149,6 +149,12 @@ def test_each_failed_or_malformed_source_degrades_independently():
     assert CANARY not in json.dumps(result)
 
 
+def test_single_active_provider_yields_exactly_one_provider():
+    result = build_quotas_response({"openai-codex": _codex_snapshot()}, now=NOW)
+
+    assert [provider["id"] for provider in result["providers"]] == ["codex"]
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

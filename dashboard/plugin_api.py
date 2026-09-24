@@ -17,8 +17,9 @@ import time
 import urllib.request
 from contextlib import closing
 from pathlib import Path
+from types import FunctionType
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Query
 
@@ -170,6 +171,20 @@ def _active_pool_token(provider: str) -> str | None:
 def _fetch_account_usage(provider: str, api_key: str | None = None, use_pool: bool = True) -> Any:
     module = importlib.import_module("agent.account_usage")
     token = api_key or (_active_pool_token(provider) if use_pool else None)
+    if provider == "anthropic" and token:
+        # Hermes <=0.21 accepts api_key here but its Anthropic fetcher ignores it
+        # and resolves the legacy singleton instead. Clone the Hermes fetcher with
+        # an isolated resolver so concurrent gateway requests are never mutated.
+        fetcher = getattr(module, "_fetch_anthropic_account_usage", None)
+        if isinstance(fetcher, FunctionType):
+            namespace = dict(fetcher.__globals__)
+            namespace["resolve_anthropic_token"] = lambda: token
+            isolated = FunctionType(
+                fetcher.__code__, namespace, fetcher.__name__, fetcher.__defaults__, fetcher.__closure__
+            )
+            isolated.__kwdefaults__ = fetcher.__kwdefaults__
+            result = isolated(api_key=token)
+            return asyncio.run(result) if inspect.isawaitable(result) else result
     result = module.fetch_account_usage(provider, api_key=token) if token else module.fetch_account_usage(provider)
     return asyncio.run(result) if inspect.isawaitable(result) else result
 
@@ -185,11 +200,21 @@ def _safe_account_label(entry: Any, index: int, secrets: tuple[str, ...]) -> str
     return label[:80]
 
 
-async def _collect_usage_provider(provider: str) -> dict[str, Any]:
+async def _collect_usage_provider(provider: str, pool: Any = None, label: str | None = None) -> dict[str, Any]:
     try:
-        pool = importlib.import_module("agent.credential_pool").load_pool(provider)
-        entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0))
+        pool = pool or importlib.import_module("agent.credential_pool").load_pool(provider)
         active = pool.peek()
+        expires_at_ms = getattr(active, "expires_at_ms", None) if active else None
+        if (
+            provider == "anthropic"
+            and active is not None
+            and getattr(active, "refresh_token", None)
+            and isinstance(expires_at_ms, (int, float))
+            and expires_at_ms <= time.time() * 1000 + 120_000
+            and callable(getattr(pool, "select", None))
+        ):
+            active = pool.select()
+        entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0))
     except Exception:
         entries, active = [], None
 
@@ -197,6 +222,7 @@ async def _collect_usage_provider(provider: str) -> dict[str, Any]:
         source = await _limited_call(_fetch_account_usage, provider, None, False)
         return {
             "pool_size": 0,
+            "provider_label": label,
             "accounts": [{"account_label": "default", "active": True, "source": source}],
         }
 
@@ -204,7 +230,11 @@ async def _collect_usage_provider(provider: str) -> dict[str, Any]:
     secrets = tuple(
         secret
         for entry in entries
-        for secret in (getattr(entry, "runtime_api_key", None), getattr(entry, "access_token", None))
+        for secret in (
+            getattr(entry, "runtime_api_key", None),
+            getattr(entry, "access_token", None),
+            getattr(entry, "refresh_token", None),
+        )
         if isinstance(secret, str) and secret
     )
     calls = []
@@ -214,6 +244,7 @@ async def _collect_usage_provider(provider: str) -> dict[str, Any]:
     snapshots = await asyncio.gather(*calls)
     return {
         "pool_size": len(entries),
+        "provider_label": label,
         "accounts": [
             {
                 "account_label": _safe_account_label(entry, index, secrets),
@@ -223,6 +254,31 @@ async def _collect_usage_provider(provider: str) -> dict[str, Any]:
             for index, entry in enumerate(entries)
         ],
     }
+
+
+def _is_local_only_provider(config: Any) -> bool:
+    urls = (
+        getattr(config, "inference_base_url", None),
+        getattr(config, "base_url", None),
+        getattr(config, "portal_base_url", None),
+    )
+    remote_seen = False
+    for value in urls:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        host = (urlparse(value).hostname or "").lower()
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        remote_seen = True
+    return not remote_seen and getattr(config, "auth_type", None) == "external_process"
+
+
+def _provider_label(config: Any, provider: str) -> str:
+    for attribute in ("display_name", "name"):
+        value = getattr(config, attribute, None)
+        if isinstance(value, str) and value.strip() and "@" not in value:
+            return value.strip()[:80]
+    return provider.replace("-", " ").title()[:80]
 
 
 def _read_env_key(path: Path, name: str) -> str | None:
@@ -294,21 +350,64 @@ async def _limited_call(function: Callable[..., Any], *args: Any) -> Any:
 
 
 async def _collect_quota_sources() -> dict[str, Any]:
+    credential_module = importlib.import_module("agent.credential_pool")
+    account_usage_module = importlib.import_module("agent.account_usage")
+    registry = getattr(credential_module, "PROVIDER_REGISTRY", {})
+    supported = set(getattr(account_usage_module, "_USAGE_FETCHERS", {}))
     deepseek_key, deepseek_source = _read_deepseek_credential()
-    anthropic, codex, deepseek = await asyncio.gather(
-        _collect_usage_provider("anthropic"),
-        _collect_usage_provider("openai-codex"),
-        _limited_call(_fetch_deepseek_balance, deepseek_key) if deepseek_key else _limited_call(_fetch_deepseek_balance),
-    )
-    return {
-        "anthropic": anthropic,
-        "openai-codex": codex,
-        "deepseek": {
-            "pool_size": 1 if deepseek_key else 0,
-            "key_source": deepseek_source,
-            "accounts": [{"account_label": "default", "active": True, "source": deepseek}],
-        },
-    }
+    active: list[tuple[str, Any, str]] = []
+    for provider in sorted(set(registry) | supported):
+        config = registry.get(provider)
+        if config is not None and _is_local_only_provider(config):
+            continue
+        try:
+            pool = credential_module.load_pool(provider)
+            if not pool.entries() and provider not in supported:
+                continue
+        except Exception:
+            continue
+        active.append((provider, pool, _provider_label(config, provider)))
+
+    if deepseek_key and all(provider != "deepseek" for provider, _, _ in active):
+        active.append(("deepseek", None, "DeepSeek"))
+
+    known_rank = {"anthropic": 0, "openai-codex": 1, "deepseek": 2}
+    active.sort(key=lambda item: (known_rank.get(item[0], 3), item[0]))
+    sources: dict[str, Any] = {}
+    for provider, pool, label in active:
+        if provider == "deepseek":
+            entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0)) if pool else []
+            active_entry = pool.peek() if pool else None
+            active_id = getattr(active_entry, "id", None)
+            if entries:
+                snapshots = await asyncio.gather(
+                    *[_limited_call(_fetch_deepseek_balance, _entry_token(entry)) for entry in entries]
+                )
+                secrets = tuple(filter(None, (_entry_token(entry) for entry in entries)))
+                accounts = [
+                    {
+                        "account_label": _safe_account_label(entry, index, secrets),
+                        "active": bool(entry is active_entry or getattr(entry, "id", None) == active_id),
+                        "source": snapshots[index],
+                    }
+                    for index, entry in enumerate(entries)
+                ]
+            else:
+                snapshot = await _limited_call(_fetch_deepseek_balance, deepseek_key)
+                accounts = [{"account_label": "default", "active": True, "source": snapshot}]
+            sources[provider] = {
+                "provider_label": label,
+                "pool_size": len(entries) or (1 if deepseek_key else 0),
+                "key_source": deepseek_source or ("pool" if entries else None),
+                "accounts": accounts,
+            }
+        else:
+            source = await _collect_usage_provider(provider, pool, label)
+            accounts = source.get("accounts", [])
+            if source.get("pool_size") == 0 and not any(account.get("source") is not None for account in accounts):
+                continue
+            sources[provider] = source
+    return sources
 
 
 async def _cached(cache: TTLCache, lock: asyncio.Lock, fresh: int, builder: Callable[[], Any]) -> dict[str, Any]:
