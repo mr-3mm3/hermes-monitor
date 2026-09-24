@@ -1,8 +1,14 @@
 name: hermes-monitor
 label: Hermes Monitor
-version: 0.2.1
+version: 0.2.2
 description: Kanban worker health (live activity, stall and loop detection) and provider quota status in the Hermes Desktop status bar.
+author: Hermes Monitor contributors
+manifest_version: 2
+license: MIT
+homepage: https://github.com/mr-3mm3/hermes-monitor
+tags: [desktop, kanban, monitoring, quotas]
 requires_hermes: ">=0.21"
+capabilities: []
 provides_tools: []
 provides_hooks: []
 provides_middleware: []

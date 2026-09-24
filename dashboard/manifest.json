@@ -1,1 +1,7 @@
-{"name":"hermes-monitor","api":"plugin_api.py"}
+{
+  "name": "hermes-monitor",
+  "label": "Hermes Monitor",
+  "description": "Kanban worker health and provider quota status for Hermes Desktop.",
+  "version": "0.2.2",
+  "api": "plugin_api.py"
+}

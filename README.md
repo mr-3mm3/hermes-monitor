@@ -17,7 +17,9 @@ Open the Worker item to see each running card, its title, assignee, runtime, las
 - Hermes 0.21 or later
 - Hermes Desktop
 
-## Installation
+## Install in Hermes
+
+[Install in Hermes](hermes://plugin/install?repo=mr-3mm3/hermes-monitor)
 
 Install the package:
 
@@ -43,6 +45,10 @@ hermes plugins enable hermes-monitor
 ```
 
 Add `hermes-monitor` to `plugins.enabled` if the enable command is unavailable, then restart the gateway (`hermes gateway restart`) so the backend routes are loaded, and quit and reopen Hermes Desktop so the footer items appear.
+
+### Official catalog publication
+
+The Hermes plugin catalog accepts owner-maintained public repositories through a pull request that adds `plugin-catalog/hermes-monitor.yaml` to `NousResearch/hermes-agent`. The entry must pin an exact 40-character commit SHA, describe the plugin's actual capabilities, and pass the catalog validation workflow. Published plugins must have a release/tag and must not update their own installed files; updates are reviewed as catalog SHA-bump pull requests.
 
 ## Worker health states
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Packaging/compliance for Hermes plugin publication: completed plugin.yaml metadata (author, license, repository, permissions), manifest schema, LICENSE file, install docs.
+
 ## 0.2.1
 
 - Fixed Claude quotas showing `n/a` for the active credential-pool account (OAuth token handling).
