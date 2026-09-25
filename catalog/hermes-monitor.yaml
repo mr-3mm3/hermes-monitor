@@ -1,0 +1,17 @@
+# Source release: v0.2.2 (plugin.yaml version 0.2.2)
+# Screenshot asset: docs/footer.png
+name: hermes-monitor
+repo: https://github.com/mr-3mm3/hermes-monitor
+sha: 40f524b4f2d108ffe0272ce6489640fa2edc6b27
+description: Kanban worker health, stall and loop detection, and provider quota status in the Hermes Desktop status bar.
+maintainer: Hermes Monitor contributors
+tier: community
+category: desktop
+requires_hermes: ">=0.21"
+docs_url: https://github.com/mr-3mm3/hermes-monitor#readme
+platforms: []
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
