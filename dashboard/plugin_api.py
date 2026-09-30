@@ -200,7 +200,33 @@ def _safe_account_label(entry: Any, index: int, secrets: tuple[str, ...]) -> str
     return label[:80]
 
 
-async def _collect_usage_provider(provider: str, pool: Any = None, label: str | None = None) -> dict[str, Any]:
+async def _entry_snapshot(provider: str, entry: Any, shared: dict[str, Any] | None = None) -> Any:
+    """Usage snapshot for one pool entry, fetched at most once per credential.
+
+    A shared (global/Keychain) credential store resolves the same entries for every profile
+    home, so a per-profile fetch would issue N identical calls to the provider's usage API.
+    Those endpoints rate-limit aggressively (Anthropic answers 429 with a ~3 minute
+    ``Retry-After``), which turned every window into "n/a"; ``shared`` carries the snapshot —
+    including a failed one — across profiles.
+    """
+    key = getattr(entry, "id", None)
+    if shared is not None and key is not None and key in shared:
+        return shared[key]
+    token = _entry_token(entry)
+    if not token:
+        return None
+    result = await _limited_call(_fetch_account_usage, provider, token, False)
+    if shared is not None and key is not None:
+        shared[key] = result
+    return result
+
+
+async def _collect_usage_provider(
+    provider: str,
+    pool: Any = None,
+    label: str | None = None,
+    shared: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         pool = pool or importlib.import_module("agent.credential_pool").load_pool(provider)
         active = pool.peek()
@@ -237,10 +263,7 @@ async def _collect_usage_provider(provider: str, pool: Any = None, label: str | 
         )
         if isinstance(secret, str) and secret
     )
-    calls = []
-    for entry in entries:
-        token = _entry_token(entry)
-        calls.append(_limited_call(_fetch_account_usage, provider, token, False) if token else asyncio.sleep(0, result=None))
+    calls = [_entry_snapshot(provider, entry, shared) for entry in entries]
     snapshots = await asyncio.gather(*calls)
     return {
         "pool_size": len(entries),
@@ -424,10 +447,11 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
     singleton_account: dict[str, Any] | None = None
     singleton_profile = "default"
     singleton_active = True
+    shared: dict[str, Any] = {}
     for profile_index, (profile_name, home_path) in enumerate(profiles):
         try:
             pool = _load_pool_for_profile(credential_module, provider, home_path)
-            envelope = await _collect_usage_provider(provider, pool, label)
+            envelope = await _collect_usage_provider(provider, pool, label, shared)
         except Exception:
             continue
         for account in envelope.get("accounts", []):

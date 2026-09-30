@@ -702,6 +702,52 @@ def test_cross_profile_shared_singleton_fallback_reported_once():
     assert claude["status"] == "ok"
 
 
+def test_cross_profile_reuses_one_fetch_per_unique_credential():
+    root = Path("/tmp/hermes-root")
+    profiles = [
+        ("default", root),
+        ("profile-alpha", root / "profiles" / "profile-alpha"),
+        ("profile-beta", root / "profiles" / "profile-beta"),
+    ]
+    entry_a = _pool_entry("id-a", "primary", "token-a", 0)
+    entry_b = _pool_entry("id-b", "backup", "token-b", 1)
+    calls = []
+
+    def load_pool(provider):
+        # A shared (global/Keychain) store resolves the same two credentials for every home.
+        return _FakePool([entry_a, entry_b], entry_a)
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    def fake_usage(provider, api_key=None, use_pool=True):
+        calls.append((provider, api_key))
+        return _usage_snapshot()
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=profiles
+    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=fake_usage), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
+
+    # Three profiles share one credential store: each credential must be fetched once, not once per profile.
+    assert calls == [("anthropic", "token-a"), ("anthropic", "token-b")]
+    assert [account["account_label"] for account in claude["accounts"]] == ["primary", "backup"]
+    assert [account["profile"] for account in claude["accounts"]] == ["default", "default"]
+    assert claude["pool_size"] == 2
+    assert claude["status"] == "ok"
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed Claude quotas stuck at `n/a` on the Desktop backend: a credential store shared by several profiles was queried once per profile, so the same accounts were fetched 8 times per refresh. Anthropic's usage endpoint answers those bursts with `429` (about three minutes of `Retry-After`) and every window fell back to `n/a`. Each credential is now fetched once per collection and the result is reused across profiles.
+
 ## 0.2.2
 
 - Packaging/compliance for Hermes plugin publication: completed plugin.yaml metadata (author, license, repository, permissions), manifest schema, LICENSE file, install docs.
