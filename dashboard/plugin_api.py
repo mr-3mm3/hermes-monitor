@@ -223,7 +223,7 @@ async def _collect_usage_provider(provider: str, pool: Any = None, label: str | 
         return {
             "pool_size": 0,
             "provider_label": label,
-            "accounts": [{"account_label": "default", "active": True, "source": source}],
+            "accounts": [{"entry_id": None, "account_label": "default", "active": True, "source": source}],
         }
 
     active_id = getattr(active, "id", None)
@@ -247,6 +247,7 @@ async def _collect_usage_provider(provider: str, pool: Any = None, label: str | 
         "provider_label": label,
         "accounts": [
             {
+                "entry_id": getattr(entry, "id", None),
                 "account_label": _safe_account_label(entry, index, secrets),
                 "active": bool(active is entry or (active_id is not None and getattr(entry, "id", None) == active_id)),
                 "source": snapshots[index],
@@ -349,64 +350,161 @@ async def _limited_call(function: Callable[..., Any], *args: Any) -> Any:
         return None
 
 
+def _enumerate_profiles() -> list[tuple[str, Path]]:
+    """Return ``(profile_name, home_path)`` for the backend's own home and every named profile.
+
+    The backend's own home is first (labelled ``default``); it carries the pool the current
+    session actually resolves against. Remaining entries are the sibling profiles under
+    ``<root>/profiles/``, in alphabetical order. Only plain directory names survive (no
+    separators, ``@``, or control characters), so a profile name can never smuggle a path or
+    a credential-shaped label into the response.
+    """
+    root = _hermes_home()
+    profiles: list[tuple[str, Path]] = [("default", root)]
+    profiles_dir = root / "profiles"
+    try:
+        children = sorted((entry for entry in profiles_dir.iterdir() if entry.is_dir()), key=lambda p: p.name)
+    except OSError:
+        return profiles
+    for child in children:
+        name = child.name
+        if name == "default":
+            # The root home is already labelled "default"; a sibling directory of the same name
+            # is either a stray or a duplicate of the root profile, so it is not enumerated.
+            continue
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+            profiles.append((name, child))
+    return profiles
+
+
+def _load_pool_for_profile(credential_module: Any, provider: str, home_path: Path) -> Any:
+    """Load *provider*'s pool resolved against *home_path*, leaving the process home untouched.
+
+    Prefers Hermes' context-local override (``hermes_constants.set_hermes_home_override``),
+    which is thread-safe; falls back to a scoped ``HERMES_HOME`` env swap when that module is
+    unavailable (e.g. under tests). The credential store caches are keyed by path, so distinct
+    profile homes never collide.
+    """
+    try:
+        constants = importlib.import_module("hermes_constants")
+        set_override = getattr(constants, "set_hermes_home_override", None)
+        reset_override = getattr(constants, "reset_hermes_home_override", None)
+    except Exception:
+        set_override = reset_override = None
+    if callable(set_override) and callable(reset_override):
+        token = set_override(str(home_path))
+        try:
+            return credential_module.load_pool(provider)
+        finally:
+            reset_override(token)
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(home_path)
+    try:
+        return credential_module.load_pool(provider)
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tuple[str, Path]], label: str) -> dict[str, Any] | None:
+    """Collect *provider* usage across every profile, deduplicating accounts by entry id.
+
+    Accounts are tagged with their ``profile`` (the profile whose own auth.json holds the
+    entry). A shared singleton/Keychain fallback (empty pool, ``entry_id is None``) is reported
+    once, from the first profile that resolves it. Only the backend's own home can mark an
+    account ``active``; accounts surfaced from sibling profiles are always ``active=False``.
+    """
+    credential_module = importlib.import_module("agent.credential_pool")
+    accounts_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    entry_profile: dict[str, str] = {}
+    entry_active: dict[str, bool] = {}
+    singleton_account: dict[str, Any] | None = None
+    singleton_profile = "default"
+    singleton_active = True
+    for profile_index, (profile_name, home_path) in enumerate(profiles):
+        try:
+            pool = _load_pool_for_profile(credential_module, provider, home_path)
+            envelope = await _collect_usage_provider(provider, pool, label)
+        except Exception:
+            continue
+        for account in envelope.get("accounts", []):
+            entry_id = account.get("entry_id")
+            if entry_id is None:
+                # Shared singleton/Keychain fallback: report once, from the backend's own home.
+                if profile_index == 0 and singleton_account is None:
+                    singleton_account = account
+                    singleton_profile = profile_name
+                    singleton_active = bool(account.get("active"))
+                continue
+            if entry_id in accounts_by_id:
+                continue
+            accounts_by_id[entry_id] = account
+            order.append(entry_id)
+            entry_profile[entry_id] = profile_name
+            entry_active[entry_id] = profile_index == 0 and bool(account.get("active"))
+    accounts: list[dict[str, Any]] = []
+    for entry_id in order:
+        account = dict(accounts_by_id[entry_id])
+        account.pop("entry_id", None)
+        account["profile"] = entry_profile[entry_id]
+        account["active"] = entry_active[entry_id]
+        accounts.append(account)
+    if singleton_account is not None:
+        account = dict(singleton_account)
+        account.pop("entry_id", None)
+        account["profile"] = singleton_profile
+        account["active"] = singleton_active
+        accounts.insert(0, account)
+    if not accounts:
+        return None
+    return {"pool_size": len(order), "provider_label": label, "accounts": accounts}
+
+
 async def _collect_quota_sources() -> dict[str, Any]:
     credential_module = importlib.import_module("agent.credential_pool")
     account_usage_module = importlib.import_module("agent.account_usage")
     registry = getattr(credential_module, "PROVIDER_REGISTRY", {})
     supported = set(getattr(account_usage_module, "_USAGE_FETCHERS", {}))
     deepseek_key, deepseek_source = _read_deepseek_credential()
-    active: list[tuple[str, Any, str]] = []
+    profiles = _enumerate_profiles()
+
+    providers: list[tuple[str, str]] = []
     for provider in sorted(set(registry) | supported):
         config = registry.get(provider)
         if config is not None and _is_local_only_provider(config):
             continue
-        try:
-            pool = credential_module.load_pool(provider)
-            if not pool.entries() and provider not in supported:
-                continue
-        except Exception:
-            continue
-        active.append((provider, pool, _provider_label(config, provider)))
+        providers.append((provider, _provider_label(config, provider)))
 
-    if deepseek_key and all(provider != "deepseek" for provider, _, _ in active):
-        active.append(("deepseek", None, "DeepSeek"))
+    if deepseek_key and all(provider != "deepseek" for provider, _ in providers):
+        providers.append(("deepseek", "DeepSeek"))
 
     known_rank = {"anthropic": 0, "openai-codex": 1, "deepseek": 2}
-    active.sort(key=lambda item: (known_rank.get(item[0], 3), item[0]))
+    providers.sort(key=lambda item: (known_rank.get(item[0], 3), item[0]))
+
     sources: dict[str, Any] = {}
-    for provider, pool, label in active:
+    for provider, label in providers:
         if provider == "deepseek":
-            entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0)) if pool else []
-            active_entry = pool.peek() if pool else None
-            active_id = getattr(active_entry, "id", None)
-            if entries:
-                snapshots = await asyncio.gather(
-                    *[_limited_call(_fetch_deepseek_balance, _entry_token(entry)) for entry in entries]
-                )
-                secrets = tuple(filter(None, (_entry_token(entry) for entry in entries)))
-                accounts = [
-                    {
-                        "account_label": _safe_account_label(entry, index, secrets),
-                        "active": bool(entry is active_entry or getattr(entry, "id", None) == active_id),
-                        "source": snapshots[index],
-                    }
-                    for index, entry in enumerate(entries)
-                ]
-            else:
-                snapshot = await _limited_call(_fetch_deepseek_balance, deepseek_key)
-                accounts = [{"account_label": "default", "active": True, "source": snapshot}]
+            # DeepSeek is key-based (DEEPSEEK_API_KEY resolved from env → root .env → the first
+            # profile .env that holds it), not a credential-pool provider, so there is no pool to
+            # aggregate across profiles here.
+            snapshot = await _limited_call(_fetch_deepseek_balance, deepseek_key)
             sources[provider] = {
                 "provider_label": label,
-                "pool_size": len(entries) or (1 if deepseek_key else 0),
-                "key_source": deepseek_source or ("pool" if entries else None),
-                "accounts": accounts,
+                "pool_size": 1 if deepseek_key else 0,
+                "key_source": deepseek_source,
+                "accounts": [{"account_label": "default", "active": True, "source": snapshot}],
             }
-        else:
-            source = await _collect_usage_provider(provider, pool, label)
-            accounts = source.get("accounts", [])
-            if source.get("pool_size") == 0 and not any(account.get("source") is not None for account in accounts):
-                continue
-            sources[provider] = source
+            continue
+        source = await _collect_usage_provider_cross_profile(provider, profiles, label)
+        if source is None:
+            continue
+        accounts = source.get("accounts", [])
+        if source.get("pool_size") == 0 and not any(account.get("source") is not None for account in accounts):
+            continue
+        sources[provider] = source
     return sources
 
 

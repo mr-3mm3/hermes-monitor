@@ -583,9 +583,11 @@ function accountView(account, index) {
   const a = account && typeof account === 'object' ? account : {}
   const raw = typeof a.account_label === 'string' ? a.account_label.trim() : ''
   const plan = typeof a.plan === 'string' ? a.plan.trim() : ''
+  const profile = typeof a.profile === 'string' ? a.profile.trim() : ''
   return {
     label: raw || `account ${index + 1}`,
     plan: plan || null,
+    profile: profile || null,
     active: a.active === true,
     ok: statusOk(a.status),
     // Non-object window entries are dropped here: a malformed payload must never
@@ -660,6 +662,13 @@ function renderAccountRow(raw, index, providerIndex) {
         style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
         children: account.label
       }, 'label'),
+      account.profile
+        ? jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+            children: `· ${account.profile}`
+          }, 'profile')
+        : null,
       account.plan
         ? jsx('span', {
             className: 'text-[0.625rem] text-(--ui-text-quaternary)',

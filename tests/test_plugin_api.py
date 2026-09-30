@@ -17,6 +17,9 @@ from dashboard import plugin_api
 NOW = 1_700_000_000
 CANARY = "canary-value-must-not-appear"
 
+# Single hermetic profile so cross-profile collection tests never touch the real ~/.hermes.
+_FAKE_PROFILES = [("default", Path("/tmp/fake-hermes"))]
+
 
 def _result_provider(result, provider_id):
     return next(provider for provider in result["providers"] if provider["id"] == provider_id)
@@ -213,6 +216,8 @@ def test_collection_isolates_failed_provider_and_preserves_two_healthy_sources()
 
     output = io.StringIO()
     with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(
         plugin_api, "_fetch_account_usage", fake_account_usage
     ), patch.object(plugin_api, "_read_deepseek_credential", return_value=("deepseek-key", "env")), patch.object(
         plugin_api, "_fetch_deepseek_balance", return_value=deepseek
@@ -363,6 +368,8 @@ def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_n
         raise AssertionError(name)
 
     with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(
         plugin_api, "_read_deepseek_credential", return_value=(None, None)
     ):
         sources = asyncio.run(plugin_api._collect_quota_sources())
@@ -404,6 +411,8 @@ def test_collection_uses_active_pool_account_and_isolates_each_account():
         raise AssertionError(name)
 
     with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(
         plugin_api, "_fetch_deepseek_balance", side_effect=RuntimeError(CANARY)
     ):
         sources = asyncio.run(plugin_api._collect_quota_sources())
@@ -444,6 +453,8 @@ def test_empty_pool_is_not_reported_as_an_active_provider():
         raise AssertionError(name)
 
     with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(
         plugin_api, "_read_deepseek_credential", return_value=(None, None)
     ):
         sources = asyncio.run(plugin_api._collect_quota_sources())
@@ -493,6 +504,8 @@ def test_deepseek_key_source_is_reported_without_key_and_missing_key_is_unavaila
         with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), patch.object(
             plugin_api.importlib, "import_module", side_effect=_empty_runtime_import
         ), patch.object(
+            plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+        ), patch.object(
             plugin_api.urllib.request, "urlopen", return_value=_FakeResponse(
                 b'{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"2"}]}'
             )
@@ -505,7 +518,9 @@ def test_deepseek_key_source_is_reported_without_key_and_missing_key_is_unavaila
 
     with tempfile.TemporaryDirectory() as directory, patch.dict(
         os.environ, {"HERMES_HOME": directory}, clear=True
-    ), patch.object(plugin_api.importlib, "import_module", side_effect=_empty_runtime_import):
+    ), patch.object(plugin_api.importlib, "import_module", side_effect=_empty_runtime_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ):
         sources = asyncio.run(plugin_api._collect_quota_sources())
     assert plugin_api.build_quotas_response(sources, now=NOW)["providers"] == []
 
@@ -556,6 +571,8 @@ def test_pool_labels_never_expose_email_or_token_in_response_or_logs():
 
     output = io.StringIO()
     with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(
         plugin_api, "_fetch_deepseek_balance", side_effect=RuntimeError(CANARY)
     ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         result = plugin_api.build_quotas_response(asyncio.run(plugin_api._collect_quota_sources()), now=NOW)
@@ -583,6 +600,106 @@ def test_worker_tool_events_expose_only_name_hash_and_timestamp():
     assert events[0]["tool_name"] == "terminal"
     assert len(events[0]["arguments_hash"]) == 16
     assert CANARY not in json.dumps(events)
+
+
+def test_enumerate_profiles_lists_default_then_sorted_sibling_dirs():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "profiles" / "zulu").mkdir(parents=True)
+        (root / "profiles" / "alpha").mkdir(parents=True)
+        (root / "profiles" / "default").mkdir(parents=True)  # duplicate of the root home → skipped
+        (root / "profiles" / "bad name").mkdir(parents=True)  # space → rejected by the name filter
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+            profiles = plugin_api._enumerate_profiles()
+
+    assert profiles[0] == ("default", root)
+    assert [name for name, _ in profiles[1:]] == ["alpha", "zulu"]
+
+
+def test_cross_profile_aggregation_dedupes_and_labels_accounts_by_profile():
+    root = Path("/tmp/hermes-root")
+    profiles = [
+        ("default", root),
+        ("profile-alpha", root / "profiles" / "profile-alpha"),
+        ("profile-beta", root / "profiles" / "profile-beta"),
+    ]
+    entry_a = _pool_entry("id-a", "primary", "token-a", 0)
+    entry_b = _pool_entry("id-b", "backup", "token-b", 1)
+    entry_c = _pool_entry("id-c", "alpha-primary", "token-c", 0)
+
+    def load_pool(provider):
+        home = os.environ.get("HERMES_HOME", "")
+        if "profile-alpha" in home:
+            return _FakePool([entry_c], entry_c)
+        if "profile-beta" in home:
+            return _FakePool([entry_a, entry_b], entry_a)  # global-root fallback reuses default ids
+        return _FakePool([entry_a, entry_b], entry_a)
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"openai-codex": SimpleNamespace(name="Codex", inference_base_url="https://chatgpt.com")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"openai-codex": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    def fake_usage(provider, api_key=None, use_pool=True):
+        return {"plan": "Pro", "windows": [{"label": "primary", "used_percent": 10, "reset_at": NOW}]}
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=profiles
+    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=fake_usage), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    codex = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "codex")
+
+    assert [account["account_label"] for account in codex["accounts"]] == ["primary", "backup", "alpha-primary"]
+    assert [account["profile"] for account in codex["accounts"]] == ["default", "default", "profile-alpha"]
+    assert [account["active"] for account in codex["accounts"]] == [True, False, False]
+    assert codex["pool_size"] == 3
+    assert "token-a" not in json.dumps(sources)
+    assert "token-c" not in json.dumps(sources)
+
+
+def test_cross_profile_shared_singleton_fallback_reported_once():
+    root = Path("/tmp/hermes-root")
+    profiles = [
+        ("default", root),
+        ("profile-alpha", root / "profiles" / "profile-alpha"),
+    ]
+
+    def load_pool(provider):
+        return _FakePool([], None)  # empty everywhere → shared Keychain/singleton fallback
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=profiles
+    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=lambda *a, **k: _usage_snapshot(percent=12)), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
+
+    assert len(claude["accounts"]) == 1
+    assert claude["accounts"][0]["account_label"] == "default"
+    assert claude["accounts"][0]["profile"] == "default"
+    assert claude["accounts"][0]["active"] is True
+    assert claude["pool_size"] == 0
+    assert claude["status"] == "ok"
 
 
 def load_tests(loader, tests, pattern):

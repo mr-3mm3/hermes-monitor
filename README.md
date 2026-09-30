@@ -64,6 +64,8 @@ Loop has priority over stalled, and stalled has priority over active when severa
 
 The quota item shows used percentage and reset time for the Claude five-hour and weekly windows and the windows returned by Codex. DeepSeek shows the remaining account balance. Missing credentials or provider failures are displayed as `n/a` and do not interrupt the status bar.
 
+Accounts are collected from every Hermes profile (the default profile plus each named profile under `profiles/`), deduplicated, and labelled with the profile they come from, so a provider reports its accounts wherever they are configured.
+
 DeepSeek credentials are resolved from the process environment, the Hermes root `.env`, then the first profile `.env` containing `DEEPSEEK_API_KEY` in alphabetical profile order.
 
 ## Privacy

@@ -101,7 +101,7 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
     plan = _value(source, "plan")
     if not isinstance(plan, str) or "@" in plan or len(plan) > 80:
         plan = None
-    return {
+    result = {
         "account_label": label,
         "plan": plan,
         "active": bool(metadata.get("active")),
@@ -109,6 +109,10 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         "windows": normalized.get("windows", []),
         "balance": normalized.get("balance"),
     }
+    profile = metadata.get("profile")
+    if isinstance(profile, str) and profile.strip() and "@" not in profile and len(profile) <= 64:
+        result["profile"] = profile.strip()
+    return result
 
 
 def _provider(source: Any, transform: Any, *, key_source: bool = False) -> dict[str, Any]:

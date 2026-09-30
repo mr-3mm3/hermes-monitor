@@ -155,6 +155,19 @@ def test_single_active_provider_yields_exactly_one_provider():
     assert [provider["id"] for provider in result["providers"]] == ["codex"]
 
 
+def test_account_profile_surfaces_from_envelope_and_is_absent_for_plain_snapshot():
+    envelope = {
+        "accounts": [
+            {"account_label": "primary", "active": True, "profile": "profile-alpha", "source": _codex_snapshot()},
+        ]
+    }
+    codex = next(p for p in build_quotas_response({"openai-codex": envelope}, now=NOW)["providers"] if p["id"] == "codex")
+    assert codex["accounts"][0]["profile"] == "profile-alpha"
+
+    plain = next(p for p in build_quotas_response({"openai-codex": _codex_snapshot()}, now=NOW)["providers"] if p["id"] == "codex")
+    assert "profile" not in plain["accounts"][0]
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():
