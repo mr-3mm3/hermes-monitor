@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import contextlib
 import io
 import json
@@ -837,9 +838,19 @@ def test_configured_provider_with_credential_but_failed_fetch_stays_visible_as_n
 def test_secret_scope_helpers_degrade_without_agent_package():
     # Outside the Hermes serve process there is no agent.secret_scope module; the helpers
     # must return None and leave _load_pool_for_profile working through the env-swap fallback.
-    scope_token = plugin_api._install_secret_scope(Path("/tmp/not-hermes"))
-    assert scope_token is None
-    plugin_api._reset_secret_scope(scope_token)  # must not raise
+    # The Hermes venv used to run these tests ships the real agent package, so force the
+    # degradation path by making the agent.secret_scope import fail.
+    real_import = builtins.__import__
+
+    def _no_secret_scope(name, *args, **kwargs):
+        if name == "agent.secret_scope":
+            raise ImportError("agent.secret_scope unavailable (simulated)")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=_no_secret_scope):
+        scope_token = plugin_api._install_secret_scope(Path("/tmp/not-hermes"))
+        assert scope_token is None
+        plugin_api._reset_secret_scope(scope_token)  # must not raise
 
 
 def test_load_pool_installs_profile_secret_scope_when_available():
