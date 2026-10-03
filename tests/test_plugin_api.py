@@ -748,6 +748,118 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
     assert claude["status"] == "ok"
 
 
+def test_pool_resolution_failure_is_reported_as_nd_instead_of_hidden():
+    def load_pool(provider):
+        raise RuntimeError(CANARY)
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda provider, **kwargs: None)
+        raise AssertionError(name)
+
+    output = io.StringIO()
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(plugin_api, "_read_deepseek_credential", return_value=(None, None)), \
+            contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        result = plugin_api.build_quotas_response(asyncio.run(plugin_api._collect_quota_sources()), now=NOW)
+
+    claude = _result_provider(result, "claude")
+    assert claude["status"] == "n/a"
+    assert claude["failures"] == ["RuntimeError"]
+    assert CANARY not in json.dumps(result)
+    assert CANARY not in output.getvalue()
+
+
+def test_unconfigured_provider_without_credential_is_hidden_from_collection():
+    # A provider with no pool entries, no singleton snapshot and no failure is
+    # "not configured": the filter must drop it so the footer only shows real accounts.
+    def load_pool(provider):
+        return _FakePool([], None)  # empty everywhere → no credential at all
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"gemini": SimpleNamespace(name="Gemini", inference_base_url="https://generativelanguage.googleapis.com")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"gemini": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(plugin_api, "_fetch_account_usage", return_value=None), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    assert "gemini" not in sources
+    assert plugin_api.build_quotas_response(sources, now=NOW)["providers"] == []
+
+
+def test_configured_provider_with_credential_but_failed_fetch_stays_visible_as_nd():
+    # A provider with a pool credential whose usage fetch fails (rate-limit/refresh) must
+    # stay visible with status n/a, not vanish like an unconfigured provider.
+    entry = _pool_entry("id-x", "primary", "token-x", 0)
+
+    def load_pool(provider):
+        return _FakePool([entry], entry)
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            return SimpleNamespace(
+                PROVIDER_REGISTRY={"openrouter": SimpleNamespace(name="OpenRouter", inference_base_url="https://openrouter.ai/api")},
+                load_pool=load_pool,
+            )
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"openrouter": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=_FAKE_PROFILES
+    ), patch.object(plugin_api, "_fetch_account_usage", return_value=None), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    assert "openrouter" in sources
+    provider = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "openrouter")
+    assert provider["status"] == "n/a"
+    assert provider["pool_size"] == 1
+
+
+def test_secret_scope_helpers_degrade_without_agent_package():
+    # Outside the Hermes serve process there is no agent.secret_scope module; the helpers
+    # must return None and leave _load_pool_for_profile working through the env-swap fallback.
+    scope_token = plugin_api._install_secret_scope(Path("/tmp/not-hermes"))
+    assert scope_token is None
+    plugin_api._reset_secret_scope(scope_token)  # must not raise
+
+
+def test_load_pool_installs_profile_secret_scope_when_available():
+    # The multiplexed serve fails closed on unscoped get_secret reads. Verify the pool loader
+    # wraps load_pool in the profile's secret scope and always resets it.
+    events = []
+
+    secret_module = SimpleNamespace(
+        build_profile_secret_scope=lambda home: {"SCOPED": "yes"},
+        set_secret_scope=lambda mapping, profile_home=None: events.append(("set", profile_home)) or "reset-token",
+        reset_secret_scope=lambda token: events.append(("reset", token)),
+    )
+    credential_module = SimpleNamespace(load_pool=lambda provider: events.append(("load", provider)) or _FakePool([], None))
+
+    with patch.dict("sys.modules", {"agent": SimpleNamespace(), "agent.secret_scope": secret_module}):
+        plugin_api._load_pool_for_profile(credential_module, "anthropic", Path("/tmp/fake-home"))
+
+    assert events == [("set", "/tmp/fake-home"), ("load", "anthropic"), ("reset", "reset-token")]
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

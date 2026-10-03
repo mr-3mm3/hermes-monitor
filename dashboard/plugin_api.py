@@ -221,12 +221,23 @@ async def _entry_snapshot(provider: str, entry: Any, shared: dict[str, Any] | No
     return result
 
 
+def _failure_name(error: BaseException) -> str:
+    """Exception class name only.
+
+    Exception messages can embed tokens, absolute home paths or URLs, so a failure is
+    identified by its class name and nothing else.
+    """
+    name = type(error).__name__
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,59}", name) else "Error"
+
+
 async def _collect_usage_provider(
     provider: str,
     pool: Any = None,
     label: str | None = None,
     shared: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    failure: str | None = None
     try:
         pool = pool or importlib.import_module("agent.credential_pool").load_pool(provider)
         active = pool.peek()
@@ -241,14 +252,16 @@ async def _collect_usage_provider(
         ):
             active = pool.select()
         entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0))
-    except Exception:
+    except Exception as error:
         entries, active = [], None
+        failure = _failure_name(error)
 
     if not entries:
         source = await _limited_call(_fetch_account_usage, provider, None, False)
         return {
             "pool_size": 0,
             "provider_label": label,
+            "failure": failure,
             "accounts": [{"entry_id": None, "account_label": "default", "active": True, "source": source}],
         }
 
@@ -268,6 +281,7 @@ async def _collect_usage_provider(
     return {
         "pool_size": len(entries),
         "provider_label": label,
+        "failure": failure,
         "accounts": [
             {
                 "entry_id": getattr(entry, "id", None),
@@ -400,13 +414,44 @@ def _enumerate_profiles() -> list[tuple[str, Path]]:
     return profiles
 
 
+def _install_secret_scope(home_path: Path) -> Any:
+    """Bind *home_path*'s profile secret scope; returns a reset token (or ``None``).
+
+    The Desktop serve multiplexes profiles and fails closed with ``UnscopedSecretError``
+    on any ``get_secret`` read with no scope installed. Pool loading resolves singletons
+    (the Anthropic OAuth/Keychain token, env API keys) through ``get_secret``, so the read
+    must run inside the profile's own scope. Degrades to no scope when the module is absent
+    (e.g. under tests), where ``get_secret`` falls back to the process env anyway.
+    """
+    try:
+        from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+    except Exception:
+        return None
+    try:
+        scope = build_profile_secret_scope(home_path)
+    except Exception:
+        scope = {}
+    return set_secret_scope(scope, profile_home=str(home_path))
+
+
+def _reset_secret_scope(token: Any) -> None:
+    if token is None:
+        return
+    try:
+        from agent.secret_scope import reset_secret_scope
+    except Exception:
+        return
+    reset_secret_scope(token)
+
+
 def _load_pool_for_profile(credential_module: Any, provider: str, home_path: Path) -> Any:
     """Load *provider*'s pool resolved against *home_path*, leaving the process home untouched.
 
     Prefers Hermes' context-local override (``hermes_constants.set_hermes_home_override``),
     which is thread-safe; falls back to a scoped ``HERMES_HOME`` env swap when that module is
     unavailable (e.g. under tests). The credential store caches are keyed by path, so distinct
-    profile homes never collide.
+    profile homes never collide. A profile secret scope is installed for the duration of the
+    read so a multiplexed serve never fails closed on unscoped ``get_secret``.
     """
     try:
         constants = importlib.import_module("hermes_constants")
@@ -414,21 +459,29 @@ def _load_pool_for_profile(credential_module: Any, provider: str, home_path: Pat
         reset_override = getattr(constants, "reset_hermes_home_override", None)
     except Exception:
         set_override = reset_override = None
-    if callable(set_override) and callable(reset_override):
-        token = set_override(str(home_path))
+
+    def load() -> Any:
+        if callable(set_override) and callable(reset_override):
+            token = set_override(str(home_path))
+            try:
+                return credential_module.load_pool(provider)
+            finally:
+                reset_override(token)
+        previous = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(home_path)
         try:
             return credential_module.load_pool(provider)
         finally:
-            reset_override(token)
-    previous = os.environ.get("HERMES_HOME")
-    os.environ["HERMES_HOME"] = str(home_path)
+            if previous is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous
+
+    secret_token = _install_secret_scope(home_path)
     try:
-        return credential_module.load_pool(provider)
+        return load()
     finally:
-        if previous is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = previous
+        _reset_secret_scope(secret_token)
 
 
 async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tuple[str, Path]], label: str) -> dict[str, Any] | None:
@@ -448,12 +501,23 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
     singleton_profile = "default"
     singleton_active = True
     shared: dict[str, Any] = {}
+    failures: set[str] = set()
     for profile_index, (profile_name, home_path) in enumerate(profiles):
+        pool = None
         try:
             pool = _load_pool_for_profile(credential_module, provider, home_path)
+        except Exception as error:
+            # A broken home must not erase the provider: fall back to the singleton
+            # resolver (``_collect_usage_provider`` retries the pool, then the singleton)
+            # and remember why, so the failure is reported instead of hidden.
+            failures.add(_failure_name(error))
+        try:
             envelope = await _collect_usage_provider(provider, pool, label, shared)
-        except Exception:
+        except Exception as error:
+            failures.add(_failure_name(error))
             continue
+        if envelope.get("failure"):
+            failures.add(str(envelope["failure"]))
         for account in envelope.get("accounts", []):
             entry_id = account.get("entry_id")
             if entry_id is None:
@@ -482,9 +546,14 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
         account["profile"] = singleton_profile
         account["active"] = singleton_active
         accounts.insert(0, account)
-    if not accounts:
+    if not accounts and not failures:
         return None
-    return {"pool_size": len(order), "provider_label": label, "accounts": accounts}
+    return {
+        "pool_size": len(order),
+        "provider_label": label,
+        "accounts": accounts,
+        "failures": sorted(failures)[:4],
+    }
 
 
 async def _collect_quota_sources() -> dict[str, Any]:
@@ -526,7 +595,12 @@ async def _collect_quota_sources() -> dict[str, Any]:
         if source is None:
             continue
         accounts = source.get("accounts", [])
-        if source.get("pool_size") == 0 and not any(account.get("source") is not None for account in accounts):
+        resolved = any(account.get("source") is not None for account in accounts)
+        # Keep dropping a provider that is simply unconfigured (empty pool, no snapshot,
+        # no failure). A provider whose resolution *failed* stays in the payload as n/a
+        # with its failure names, so a footer "n/a" is never indistinguishable from a
+        # silently swallowed error.
+        if source.get("pool_size") == 0 and not resolved and not source.get("failures"):
             continue
         sources[provider] = source
     return sources

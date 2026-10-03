@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
+
+# Exception class names only: a raw message could carry a token, an absolute home path or a URL.
+_SAFE_FAILURE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,59}")
 
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
@@ -136,6 +140,11 @@ def _provider(source: Any, transform: Any, *, key_source: bool = False) -> dict[
     if key_source:
         source_name = envelope.get("key_source") if envelope is not None else None
         result["key_source"] = source_name if isinstance(source_name, str) and "@" not in source_name else None
+    failures = envelope.get("failures") if envelope is not None else None
+    if isinstance(failures, (list, tuple)):
+        safe = sorted({str(item) for item in failures if isinstance(item, str) and _SAFE_FAILURE.fullmatch(item)})
+        if safe:
+            result["failures"] = safe[:4]
     return result
 
 

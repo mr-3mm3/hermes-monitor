@@ -168,6 +168,37 @@ def test_account_profile_surfaces_from_envelope_and_is_absent_for_plain_snapshot
     assert "profile" not in plain["accounts"][0]
 
 
+def test_provider_failures_are_sanitized_to_class_names_and_bounded():
+    envelope = {
+        "provider_label": "Anthropic",
+        "pool_size": 0,
+        "accounts": [{"account_label": "default", "active": True, "source": None}],
+        "failures": [
+            "RuntimeError",
+            "../../etc/passwd",
+            "sk-live-token",
+            "TimeoutError",
+            "ClientError",
+            "ValueError",
+            CANARY,
+        ],
+    }
+    claude = next(p for p in build_quotas_response({"anthropic": envelope}, now=NOW)["providers"] if p["id"] == "claude")
+
+    assert claude["status"] == "n/a"
+    assert claude["failures"] == ["ClientError", "RuntimeError", "TimeoutError", "ValueError"]
+    assert CANARY not in json.dumps(claude)
+
+
+def test_provider_without_failures_has_no_failures_key():
+    claude = next(
+        p for p in build_quotas_response({"anthropic": {"accounts": [{"account_label": "a", "active": True, "source": _claude_snapshot()}]}}, now=NOW)["providers"]
+        if p["id"] == "claude"
+    )
+
+    assert "failures" not in claude
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

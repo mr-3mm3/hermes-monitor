@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Fixed Claude quotas still showing `n/a` on the Desktop backend: the multiplexed serve fails closed on unscoped credential reads, so the pool loader now runs inside each profile's secret scope and can resolve the OAuth/Keychain token.
+- Quotas now show only providers with a real credential (OAuth token, API key, or a resolved DeepSeek key). Unconfigured providers are hidden; a provider that has credentials but is momentarily in error stays visible with its status.
+
 ## 0.3.1
 
 - Fixed Claude quotas stuck at `n/a` on the Desktop backend: a credential store shared by several profiles was queried once per profile, so the same accounts were fetched 8 times per refresh. Anthropic's usage endpoint answers those bursts with `429` (about three minutes of `Retry-After`) and every window fell back to `n/a`. Each credential is now fetched once per collection and the result is reused across profiles.
