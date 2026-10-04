@@ -420,14 +420,6 @@ function renderWindowBar(win) {
   }, win.label)
 }
 
-/** Footer-only view of the ACTIVE account label, capped to the statusbar budget. */
-function footerAccountLabel(p) {
-  const label = typeof p?.account_label === 'string' ? p.account_label.trim() : ''
-  if (!label) return null
-  // Credential-pool labels can be long; the click menu always shows the full one.
-  return label.length > 18 ? `${label.slice(0, 17)}…` : label
-}
-
 function footerPoolSize(p) {
   return Number.isFinite(p?.pool_size) ? Math.max(0, Math.floor(p.pool_size)) : 0
 }
@@ -442,16 +434,17 @@ function naValue(key) {
 }
 
 /**
- * Footer view of ONE provider: name, active-account label, then the active
- * account's headline figure. No provider id is special-cased — the shape of the
- * payload decides: with `windows` the FIRST window is shown (Claude's 5h
- * session, Codex's primary window), a provider without windows but with a
- * `balance` shows the amount, an explicit "n/a" status (or nothing to show at
- * all) renders "n/a". Every window, account and reset hour stays in the menu.
+ * Footer view of ONE provider: provider name and pool badge, then the active
+ * account's headline figure. The active account's own label is intentionally
+ * NOT shown here (it stays in the click menu). No provider id is special-cased
+ * — the shape of the payload decides: with `windows` the FIRST window is shown
+ * (Claude's 5h session, Codex's primary window), a provider without windows but
+ * with a `balance` shows the amount, an explicit "n/a" status (or nothing to
+ * show at all) renders "n/a". Every window, account and reset hour stays in the
+ * menu.
  */
 function renderProviderChip(p, index) {
   const windows = Array.isArray(p.windows) ? p.windows.filter(win => win && typeof win === 'object') : []
-  const accountLabel = footerAccountLabel(p)
   const poolSize = footerPoolSize(p)
   const hasBalance = balanceAmount(p.balance) !== null
 
@@ -470,16 +463,10 @@ function renderProviderChip(p, index) {
     value = naValue('value')
   }
 
-  // Which account Hermes is using, right next to the provider name. Kept on the
-  // same flex row as everything else: no wrap, no clipping, no extra bar.
+  // Pool size badge, right next to the provider name. The active-account label
+  // is deliberately omitted from the footer (only the click menu shows it).
+  // Kept on the same flex row as everything else: no wrap, no clipping.
   const labelNodes = []
-  if (accountLabel) {
-    labelNodes.push(jsx('span', {
-      className: 'text-[0.625rem] font-medium text-(--ui-text-tertiary)',
-      style: { whiteSpace: 'nowrap', lineHeight: 1, flex: '0 0 auto' },
-      children: accountLabel
-    }, 'account'))
-  }
   if (poolSize > 1) {
     labelNodes.push(jsx('span', {
       className: 'tabular-nums text-[0.625rem] text-(--ui-text-quaternary)',
