@@ -14,6 +14,8 @@ venv/
 *.db-shm
 *.sqlite
 *.sqlite3
+auth.json
+scratch_*
 
 # Tooling, editors, OS
 .codegraph/
