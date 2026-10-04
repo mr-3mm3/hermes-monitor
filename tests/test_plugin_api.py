@@ -14,6 +14,13 @@ from unittest.mock import patch
 
 from dashboard import plugin_api
 
+try:
+    from agent import credential_pool as _real_credential_pool
+    import agent.anthropic_credentials as _real_anthropic_credentials
+except Exception:  # pragma: no cover - run outside the Hermes venv
+    _real_credential_pool = None
+    _real_anthropic_credentials = None
+
 
 NOW = 1_700_000_000
 CANARY = "canary-value-must-not-appear"
@@ -45,6 +52,18 @@ def _read_key_with_home(root: Path, env_key: str | None = None):
 def _write_env(path: Path, value: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"DEEPSEEK_API_KEY={value}\n", encoding="utf-8")
+
+
+def _write_auth_json(home: Path, credential_pool: dict) -> None:
+    """Write a minimal but valid Hermes auth.json holding *credential_pool* rows."""
+    home.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "providers": {},
+        "active_provider": None,
+        "credential_pool": credential_pool,
+    }
+    (home / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_routes_are_relative_and_registered():
@@ -308,39 +327,39 @@ def test_anthropic_active_oauth_token_populates_both_windows():
     assert [window["label"] for window in claude["windows"]] == ["5h", "week"]
 
 
-def test_anthropic_expired_active_token_uses_pool_refresh_api():
-    stale = _pool_entry("active", "primary", "expired-token", 0)
-    refreshed = _pool_entry("active", "primary", "refreshed-token", 0)
-    stale.expires_at_ms = 0
-    stale.refresh_token = "refresh-material"
+def test_default_profile_can_still_refresh_its_own_token():
+    if _real_credential_pool is None:
+        raise unittest.SkipTest("real agent package required")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "root"
+        _write_auth_json(root, {
+            "anthropic": [
+                {
+                    "id": "oauth-own", "label": "claude", "source": "manual",
+                    "auth_type": "oauth", "priority": 0, "access_token": "old-access",
+                    "refresh_token": "old-refresh", "expires_at_ms": (NOW - 3600) * 1000,
+                }
+            ]
+        })
 
-    class RefreshingPool(_FakePool):
-        def __init__(self):
-            super().__init__([stale], stale)
-            self.refresh_calls = 0
+        def fake_refresh(refresh_token, *, use_json=False):
+            return {
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_at_ms": (NOW + 3600) * 1000,
+            }
 
-        def select(self):
-            self.refresh_calls += 1
-            self._entries = [refreshed]
-            self._active = refreshed
-            return refreshed
+        with patch.object(_real_anthropic_credentials, "refresh_anthropic_oauth_pure", side_effect=fake_refresh), \
+                patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+            with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+                pool = plugin_api._load_pool_for_profile(_real_credential_pool, "anthropic", root)
+                envelope = asyncio.run(plugin_api._collect_usage_provider("anthropic", pool, "Anthropic", None))
 
-    pool = RefreshingPool()
-    seen = []
-
-    def fake_import(name):
-        if name == "agent.credential_pool":
-            return SimpleNamespace(load_pool=lambda provider: pool)
-        if name == "agent.account_usage":
-            return SimpleNamespace(fetch_account_usage=lambda provider, api_key=None: seen.append(api_key) or _usage_snapshot())
-        raise AssertionError(name)
-
-    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import):
-        source = asyncio.run(plugin_api._collect_usage_provider("anthropic"))
-
-    assert pool.refresh_calls == 1
-    assert seen == ["refreshed-token"]
-    assert source["accounts"][0]["source"]["windows"]
+        # The own profile's token was rotated and persisted back into its own auth.json.
+        stored = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+        rows = stored["credential_pool"]["anthropic"]
+        assert any(row.get("access_token") == "new-access" for row in rows)
+        assert envelope["accounts"][0]["source"]["windows"]
 
 
 def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_nd():
@@ -617,53 +636,93 @@ def test_enumerate_profiles_lists_default_then_sorted_sibling_dirs():
     assert [name for name, _ in profiles[1:]] == ["alpha", "zulu"]
 
 
-def test_cross_profile_aggregation_dedupes_and_labels_accounts_by_profile():
-    root = Path("/tmp/hermes-root")
-    profiles = [
-        ("default", root),
-        ("profile-alpha", root / "profiles" / "profile-alpha"),
-        ("profile-beta", root / "profiles" / "profile-beta"),
-    ]
-    entry_a = _pool_entry("id-a", "primary", "token-a", 0)
-    entry_b = _pool_entry("id-b", "backup", "token-b", 1)
-    entry_c = _pool_entry("id-c", "alpha-primary", "token-c", 0)
+def test_sibling_quota_read_is_strictly_read_only_and_never_mutates_stores():
+    if _real_credential_pool is None:
+        raise unittest.SkipTest("real agent package required")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "root"
+        alpha = root / "profiles" / "alpha"
+        # alpha holds an aged DEAD manual entry (past the 24h prune window) and an expiring
+        # Anthropic OAuth entry — exactly the rows the old peek()/select() path mutated.
+        alpha_pool = {
+            "anthropic": [
+                {
+                    "id": "manual-dead", "label": "stale", "source": "manual",
+                    "auth_type": "api_key", "priority": 0, "access_token": "manual-secret-token",
+                    "last_status": "dead", "last_status_at": NOW - 3 * 86400,
+                    "last_error_reason": "invalid_token",
+                },
+                {
+                    "id": "oauth-exp", "label": "claude", "source": "manual",
+                    "auth_type": "oauth", "priority": 1, "access_token": "oauth-access-token",
+                    "refresh_token": "oauth-refresh-token", "expires_at_ms": (NOW - 3600) * 1000,
+                },
+            ]
+        }
+        _write_auth_json(root, {})
+        _write_auth_json(alpha, alpha_pool)
 
-    def load_pool(provider):
-        home = os.environ.get("HERMES_HOME", "")
-        if "profile-alpha" in home:
-            return _FakePool([entry_c], entry_c)
-        if "profile-beta" in home:
-            return _FakePool([entry_a, entry_b], entry_a)  # global-root fallback reuses default ids
-        return _FakePool([entry_a, entry_b], entry_a)
+        root_before = (root / "auth.json").read_bytes()
+        alpha_before = (alpha / "auth.json").read_bytes()
 
-    def fake_import(name):
-        if name == "agent.credential_pool":
-            return SimpleNamespace(
-                PROVIDER_REGISTRY={"openai-codex": SimpleNamespace(name="Codex", inference_base_url="https://chatgpt.com")},
-                load_pool=load_pool,
-            )
-        if name == "agent.account_usage":
-            return SimpleNamespace(_USAGE_FETCHERS={"openai-codex": object()}, fetch_account_usage=lambda *a, **k: None)
-        raise AssertionError(name)
+        refresh_calls = []
 
-    def fake_usage(provider, api_key=None, use_pool=True):
-        return {"plan": "Pro", "windows": [{"label": "primary", "used_percent": 10, "reset_at": NOW}]}
+        def _record_refresh(*args, **kwargs):
+            refresh_calls.append(1)
+            return {"access_token": "x", "refresh_token": "y", "expires_at_ms": 0}
 
-    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
-        plugin_api, "_enumerate_profiles", return_value=profiles
-    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=fake_usage), patch.object(
-        plugin_api, "_read_deepseek_credential", return_value=(None, None)
-    ):
-        sources = asyncio.run(plugin_api._collect_quota_sources())
+        with patch.object(_real_anthropic_credentials, "refresh_anthropic_oauth_pure", side_effect=_record_refresh), \
+                patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+            with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+                snapshots = plugin_api._snapshot_pool_for_profile(_real_credential_pool, "anthropic", alpha)
+                assert snapshots is not None
+                assert {snapshot.entry_id for snapshot in snapshots} == {"manual-dead", "oauth-exp"}
+                envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", snapshots, "Anthropic", {}))
 
-    codex = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "codex")
+        # Both stores byte-identical: the sibling was read, never written.
+        assert (root / "auth.json").read_bytes() == root_before
+        assert (alpha / "auth.json").read_bytes() == alpha_before
+        root_text = (root / "auth.json").read_text(encoding="utf-8")
+        assert "manual-secret-token" not in root_text
+        assert "oauth-refresh-token" not in root_text
+        assert refresh_calls == []
+        assert [account["active"] for account in envelope["accounts"]] == [False, False]
 
-    assert [account["account_label"] for account in codex["accounts"]] == ["primary", "backup", "alpha-primary"]
-    assert [account["profile"] for account in codex["accounts"]] == ["default", "default", "profile-alpha"]
-    assert [account["active"] for account in codex["accounts"]] == [True, False, False]
-    assert codex["pool_size"] == 3
-    assert "token-a" not in json.dumps(sources)
-    assert "token-c" not in json.dumps(sources)
+
+def test_cross_profile_readonly_snapshots_dedup_and_label_by_profile():
+    if _real_credential_pool is None:
+        raise unittest.SkipTest("real agent package required")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "root"
+        alpha = root / "profiles" / "alpha"
+        _write_auth_json(root, {
+            "openai-codex": [
+                {"id": "id-a", "label": "primary", "source": "manual", "auth_type": "api_key", "priority": 0, "access_token": "token-a"},
+                {"id": "id-b", "label": "backup", "source": "manual", "auth_type": "api_key", "priority": 1, "access_token": "token-b"},
+            ]
+        })
+        _write_auth_json(alpha, {
+            "openai-codex": [
+                {"id": "id-c", "label": "alpha-primary", "source": "manual", "auth_type": "api_key", "priority": 0, "access_token": "token-c"},
+            ]
+        })
+        profiles = [("default", root), ("alpha", alpha)]
+
+        def fake_usage(provider, api_key=None, use_pool=True):
+            return {"plan": "Pro", "windows": [{"label": "primary", "used_percent": 10, "reset_at": NOW}]}
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+                patch.object(plugin_api, "_fetch_account_usage", side_effect=fake_usage):
+            source = asyncio.run(plugin_api._collect_usage_provider_cross_profile("openai-codex", profiles, "Codex"))
+
+        codex = _result_provider(plugin_api.build_quotas_response({"openai-codex": source}, now=NOW), "codex")
+
+        assert [account["account_label"] for account in codex["accounts"]] == ["primary", "backup", "alpha-primary"]
+        assert [account["profile"] for account in codex["accounts"]] == ["default", "default", "alpha"]
+        assert [account["active"] for account in codex["accounts"]] == [True, False, False]
+        assert codex["pool_size"] == 3
+        assert "token-a" not in json.dumps(source)
+        assert "token-c" not in json.dumps(source)
 
 
 def test_cross_profile_shared_singleton_fallback_reported_once():

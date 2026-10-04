@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- Security: quota aggregation is now strictly read-only for non-active profiles. The old loader installed a sibling profile's home and secret scope only while loading its credential pool, then handed back the live pool and called `peek()`/`select()` on it after the scope was reset — which could prune aged-out DEAD entries, refresh an expired Anthropic OAuth token, and persist the result into the wrong profile's `auth.json`. Sibling profiles are now read into an immutable snapshot inside their own scope and only usage requests are issued against it; an expired sibling token reports `n/a` instead of being refreshed. Only the backend's own profile refreshes its own token. The process-global `HERMES_HOME` env-swap fallback was removed in favour of the context-local home override.
+
 ## 0.3.2
 
 - Fixed Claude quotas still showing `n/a` on the Desktop backend: the multiplexed serve fails closed on unscoped credential reads, so the pool loader now runs inside each profile's secret scope and can resolve the OAuth/Keychain token.
