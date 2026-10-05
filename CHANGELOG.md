@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- Security: quota reads now resolve the active Hermes profile as their own home and use immutable credential snapshots for every profile, including the active profile. The root home is still included as a read-only sibling when a named profile is active, preventing expired root credentials from being refreshed or copied into the active profile's `auth.json`.
+
 ## 0.3.3
 
 - Security: quota aggregation is now strictly read-only for non-active profiles. The old loader installed a sibling profile's home and secret scope only while loading its credential pool, then handed back the live pool and called `peek()`/`select()` on it after the scope was reset — which could prune aged-out DEAD entries, refresh an expired Anthropic OAuth token, and persist the result into the wrong profile's `auth.json`. Sibling profiles are now read into an immutable snapshot inside their own scope and only usage requests are issued against it; an expired sibling token reports `n/a` instead of being refreshed. Only the backend's own profile refreshes its own token. The process-global `HERMES_HOME` env-swap fallback was removed in favour of the context-local home override.

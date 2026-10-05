@@ -72,14 +72,13 @@ DeepSeek credentials are resolved from the process environment, the Hermes root 
 
 The backend opens the local Kanban and worker session databases in read-only mode. It returns activity metadata only. Message content and tool arguments never reach the frontend; arguments are represented by hashes for loop detection.
 
-Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`) and the account-usage API calls already used by Hermes for Claude and Codex. No request writes or rotates credentials. Each external call has a 15-second timeout, and quota results are cached for five minutes.
+Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`) and the account-usage API calls already used by Hermes for Claude and Codex. Hermes core may refresh an Anthropic token for the active profile near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`; quota reads themselves use immutable snapshots and never refresh credentials. Each external call has a 15-second timeout, and quota results are cached for five minutes.
 
 ### Which credential files are read
 
 To aggregate quotas across profiles, the backend reads the credential store (`auth.json`) of every Hermes profile — the default home and each named profile under `profiles/` — one profile at a time. Each read is strictly read-only.
 
-- The backend's own profile is the only one whose credential pool may be mutated: it is allowed to refresh its own OAuth token when it is expired or about to expire.
-- Non-active (sibling) profiles are never mutated, refreshed, or persisted to. Their accounts are read into an immutable snapshot and only usage requests are issued against that snapshot; an expired sibling token is reported as `n/a` instead of being refreshed.
+- Active and non-active profiles are never mutated, refreshed, or persisted to during quota reads. Their accounts are read into immutable snapshots and only usage requests are issued against those snapshots; an expired token is reported as `n/a` instead of being refreshed.
 - No secret from one profile is ever copied into another profile's credential store.
 
 No profile names, absolute paths, tokens, or other personal data leave the backend.
