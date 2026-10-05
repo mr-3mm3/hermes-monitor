@@ -229,7 +229,7 @@ def test_collection_isolates_failed_provider_and_preserves_two_healthy_sources()
 
     def fake_import(name):
         if name == "agent.credential_pool":
-            return SimpleNamespace(PROVIDER_REGISTRY=registry, load_pool=lambda provider: pools[provider])
+            return _fake_credential_module(registry, pools)
         if name == "agent.account_usage":
             return SimpleNamespace(_USAGE_FETCHERS=dict.fromkeys(pools), fetch_account_usage=lambda *args, **kwargs: None)
         raise AssertionError(name)
@@ -272,6 +272,28 @@ def _pool_entry(identifier, label, token, priority):
         priority=priority,
         runtime_api_key=token,
         access_token=token,
+    )
+
+
+def _fake_credential_module(registry, pools):
+    def read_credential_pool(provider):
+        pool = pools.get(provider, _FakePool([]))
+        return [
+            {
+                "id": entry.id,
+                "label": entry.label,
+                "priority": entry.priority,
+                "source": "manual",
+                "auth_type": "api_key",
+                "access_token": entry.access_token,
+            }
+            for entry in pool.entries()
+        ]
+
+    return SimpleNamespace(
+        PROVIDER_REGISTRY=registry,
+        load_pool=lambda provider: pools.get(provider, _FakePool([])),
+        read_credential_pool=read_credential_pool,
     )
 
 
@@ -327,39 +349,25 @@ def test_anthropic_active_oauth_token_populates_both_windows():
     assert [window["label"] for window in claude["windows"]] == ["5h", "week"]
 
 
-def test_default_profile_can_still_refresh_its_own_token():
-    if _real_credential_pool is None:
-        raise unittest.SkipTest("real agent package required")
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory) / "root"
-        _write_auth_json(root, {
-            "anthropic": [
-                {
-                    "id": "oauth-own", "label": "claude", "source": "manual",
-                    "auth_type": "oauth", "priority": 0, "access_token": "old-access",
-                    "refresh_token": "old-refresh", "expires_at_ms": (NOW - 3600) * 1000,
-                }
-            ]
-        })
+def test_usage_collection_never_selects_an_expiring_token():
+    active = SimpleNamespace(
+        id="oauth-own", label="claude", priority=0, access_token="old-access",
+        refresh_token="old-refresh", expires_at_ms=(NOW - 3600) * 1000,
+    )
+    select_calls = []
 
-        def fake_refresh(refresh_token, *, use_json=False):
-            return {
-                "access_token": "new-access",
-                "refresh_token": "new-refresh",
-                "expires_at_ms": (NOW + 3600) * 1000,
-            }
+    class Pool(_FakePool):
+        def select(self):
+            select_calls.append(1)
+            return self._active
 
-        with patch.object(_real_anthropic_credentials, "refresh_anthropic_oauth_pure", side_effect=fake_refresh), \
-                patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
-            with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
-                pool = plugin_api._load_pool_for_profile(_real_credential_pool, "anthropic", root)
-                envelope = asyncio.run(plugin_api._collect_usage_provider("anthropic", pool, "Anthropic", None))
+    with patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+        envelope = asyncio.run(
+            plugin_api._collect_usage_provider("anthropic", Pool([active], active), "Anthropic", None)
+        )
 
-        # The own profile's token was rotated and persisted back into its own auth.json.
-        stored = json.loads((root / "auth.json").read_text(encoding="utf-8"))
-        rows = stored["credential_pool"]["anthropic"]
-        assert any(row.get("access_token") == "new-access" for row in rows)
-        assert envelope["accounts"][0]["source"]["windows"]
+    assert select_calls == []
+    assert envelope["accounts"][0]["source"]["windows"]
 
 
 def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_nd():
@@ -379,7 +387,7 @@ def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_n
 
     def fake_import(name):
         if name == "agent.credential_pool":
-            return SimpleNamespace(PROVIDER_REGISTRY=registry, load_pool=lambda provider: pools.get(provider, _FakePool([])))
+            return _fake_credential_module(registry, pools)
         if name == "agent.account_usage":
             return SimpleNamespace(
                 _USAGE_FETCHERS={"anthropic": object(), "openai-codex": object()},
@@ -415,7 +423,7 @@ def test_collection_uses_active_pool_account_and_isolates_each_account():
                 provider: SimpleNamespace(name=provider, inference_base_url="https://example.invalid")
                 for provider in pools
             }
-            return SimpleNamespace(PROVIDER_REGISTRY=registry, load_pool=lambda provider: pools[provider])
+            return _fake_credential_module(registry, pools)
         if name == "agent.account_usage":
             def fetch(provider, api_key=None):
                 if api_key == "pool-token-two":
@@ -462,7 +470,7 @@ def test_empty_pool_is_not_reported_as_an_active_provider():
                 "anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com"),
                 "openai-codex": SimpleNamespace(name="Codex", inference_base_url="https://chatgpt.com"),
             }
-            return SimpleNamespace(PROVIDER_REGISTRY=registry, load_pool=lambda provider: _FakePool([], None))
+            return _fake_credential_module(registry, {})
         if name == "agent.account_usage":
             def fetch(provider, **kwargs):
                 calls.append((provider, kwargs))
@@ -481,7 +489,7 @@ def test_empty_pool_is_not_reported_as_an_active_provider():
     result = plugin_api.build_quotas_response(sources, now=NOW)
 
     assert result["providers"] == []
-    assert calls == [("anthropic", {}), ("openai-codex", {})]
+    assert calls == []
 
 
 def test_unavailable_pool_falls_back_to_singleton_without_retrying_pool_token():
@@ -636,6 +644,77 @@ def test_enumerate_profiles_lists_default_then_sorted_sibling_dirs():
     assert [name for name, _ in profiles[1:]] == ["alpha", "zulu"]
 
 
+def test_named_profile_quota_read_never_writes_or_copies_root_credentials():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "root"
+        work = root / "profiles" / "work"
+        _write_auth_json(root, {
+            "anthropic": [
+                {
+                    "id": "root-oauth", "label": "root", "source": "manual",
+                    "auth_type": "oauth", "priority": 0, "access_token": "root-access",
+                    "refresh_token": "root-refresh", "expires_at_ms": (NOW - 3600) * 1000,
+                }
+            ]
+        })
+        _write_auth_json(work, {
+            "anthropic": [
+                {
+                    "id": "work-oauth", "label": "work", "source": "manual",
+                    "auth_type": "oauth", "priority": 0, "access_token": "work-access",
+                    "refresh_token": "work-refresh", "expires_at_ms": (NOW + 3600) * 1000,
+                }
+            ]
+        })
+        root_before = (root / "auth.json").read_bytes()
+        work_before = (work / "auth.json").read_bytes()
+        override: dict[str, Path | None] = {"home": None}
+
+        def set_home(value):
+            previous = override["home"]
+            override["home"] = Path(value)
+            return previous
+
+        def reset_home(previous):
+            override["home"] = previous
+
+        constants = SimpleNamespace(
+            get_hermes_home=lambda: Path(os.environ["HERMES_HOME"]),
+            set_hermes_home_override=set_home,
+            reset_hermes_home_override=reset_home,
+        )
+
+        def read_credential_pool(provider):
+            home = override["home"] or constants.get_hermes_home()
+            payload = json.loads((home / "auth.json").read_text(encoding="utf-8"))
+            return payload["credential_pool"].get(provider, [])
+
+        credential_module = SimpleNamespace(read_credential_pool=read_credential_pool)
+
+        def fake_import(name):
+            if name == "hermes_constants":
+                return constants
+            if name == "agent.credential_pool":
+                return credential_module
+            raise AssertionError(name)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(work)}, clear=True), \
+                patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), \
+                patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+            profiles = plugin_api._enumerate_profiles()
+            source = asyncio.run(
+                plugin_api._collect_usage_provider_cross_profile("anthropic", profiles, "Anthropic")
+            )
+
+        assert source is not None
+        assert profiles[:2] == [("work", work), ("default", root)]
+        assert (root / "auth.json").read_bytes() == root_before
+        assert (work / "auth.json").read_bytes() == work_before
+        stored_work = json.loads((work / "auth.json").read_text(encoding="utf-8"))
+        assert {row["id"] for row in stored_work["credential_pool"]["anthropic"]} == {"work-oauth"}
+        assert [account["profile"] for account in source["accounts"]] == ["work", "default"]
+
+
 def test_sibling_quota_read_is_strictly_read_only_and_never_mutates_stores():
     if _real_credential_pool is None:
         raise unittest.SkipTest("real agent package required")
@@ -725,43 +804,6 @@ def test_cross_profile_readonly_snapshots_dedup_and_label_by_profile():
         assert "token-c" not in json.dumps(source)
 
 
-def test_cross_profile_shared_singleton_fallback_reported_once():
-    root = Path("/tmp/hermes-root")
-    profiles = [
-        ("default", root),
-        ("profile-alpha", root / "profiles" / "profile-alpha"),
-    ]
-
-    def load_pool(provider):
-        return _FakePool([], None)  # empty everywhere → shared Keychain/singleton fallback
-
-    def fake_import(name):
-        if name == "agent.credential_pool":
-            return SimpleNamespace(
-                PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
-                load_pool=load_pool,
-            )
-        if name == "agent.account_usage":
-            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
-        raise AssertionError(name)
-
-    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
-        plugin_api, "_enumerate_profiles", return_value=profiles
-    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=lambda *a, **k: _usage_snapshot(percent=12)), patch.object(
-        plugin_api, "_read_deepseek_credential", return_value=(None, None)
-    ):
-        sources = asyncio.run(plugin_api._collect_quota_sources())
-
-    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
-
-    assert len(claude["accounts"]) == 1
-    assert claude["accounts"][0]["account_label"] == "default"
-    assert claude["accounts"][0]["profile"] == "default"
-    assert claude["accounts"][0]["active"] is True
-    assert claude["pool_size"] == 0
-    assert claude["status"] == "ok"
-
-
 def test_cross_profile_reuses_one_fetch_per_unique_credential():
     root = Path("/tmp/hermes-root")
     profiles = [
@@ -779,10 +821,8 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
 
     def fake_import(name):
         if name == "agent.credential_pool":
-            return SimpleNamespace(
-                PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
-                load_pool=load_pool,
-            )
+            registry = {"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")}
+            return _fake_credential_module(registry, {"anthropic": load_pool("anthropic")})
         if name == "agent.account_usage":
             return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
         raise AssertionError(name)
@@ -809,14 +849,14 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
 
 
 def test_pool_resolution_failure_is_reported_as_nd_instead_of_hidden():
-    def load_pool(provider):
+    def read_credential_pool(provider):
         raise RuntimeError(CANARY)
 
     def fake_import(name):
         if name == "agent.credential_pool":
             return SimpleNamespace(
                 PROVIDER_REGISTRY={"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")},
-                load_pool=load_pool,
+                read_credential_pool=read_credential_pool,
             )
         if name == "agent.account_usage":
             return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda provider, **kwargs: None)
@@ -844,10 +884,8 @@ def test_unconfigured_provider_without_credential_is_hidden_from_collection():
 
     def fake_import(name):
         if name == "agent.credential_pool":
-            return SimpleNamespace(
-                PROVIDER_REGISTRY={"gemini": SimpleNamespace(name="Gemini", inference_base_url="https://generativelanguage.googleapis.com")},
-                load_pool=load_pool,
-            )
+            registry = {"gemini": SimpleNamespace(name="Gemini", inference_base_url="https://generativelanguage.googleapis.com")}
+            return _fake_credential_module(registry, {"gemini": load_pool("gemini")})
         if name == "agent.account_usage":
             return SimpleNamespace(_USAGE_FETCHERS={"gemini": object()}, fetch_account_usage=lambda *a, **k: None)
         raise AssertionError(name)
@@ -873,10 +911,8 @@ def test_configured_provider_with_credential_but_failed_fetch_stays_visible_as_n
 
     def fake_import(name):
         if name == "agent.credential_pool":
-            return SimpleNamespace(
-                PROVIDER_REGISTRY={"openrouter": SimpleNamespace(name="OpenRouter", inference_base_url="https://openrouter.ai/api")},
-                load_pool=load_pool,
-            )
+            registry = {"openrouter": SimpleNamespace(name="OpenRouter", inference_base_url="https://openrouter.ai/api")}
+            return _fake_credential_module(registry, {"openrouter": load_pool("openrouter")})
         if name == "agent.account_usage":
             return SimpleNamespace(_USAGE_FETCHERS={"openrouter": object()}, fetch_account_usage=lambda *a, **k: None)
         raise AssertionError(name)
@@ -896,7 +932,7 @@ def test_configured_provider_with_credential_but_failed_fetch_stays_visible_as_n
 
 def test_secret_scope_helpers_degrade_without_agent_package():
     # Outside the Hermes serve process there is no agent.secret_scope module; the helpers
-    # must return None and leave _load_pool_for_profile working through the env-swap fallback.
+    # must return None without breaking read-only credential snapshots.
     # The Hermes venv used to run these tests ships the real agent package, so force the
     # degradation path by making the agent.secret_scope import fail.
     real_import = builtins.__import__
@@ -910,24 +946,6 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         scope_token = plugin_api._install_secret_scope(Path("/tmp/not-hermes"))
         assert scope_token is None
         plugin_api._reset_secret_scope(scope_token)  # must not raise
-
-
-def test_load_pool_installs_profile_secret_scope_when_available():
-    # The multiplexed serve fails closed on unscoped get_secret reads. Verify the pool loader
-    # wraps load_pool in the profile's secret scope and always resets it.
-    events = []
-
-    secret_module = SimpleNamespace(
-        build_profile_secret_scope=lambda home: {"SCOPED": "yes"},
-        set_secret_scope=lambda mapping, profile_home=None: events.append(("set", profile_home)) or "reset-token",
-        reset_secret_scope=lambda token: events.append(("reset", token)),
-    )
-    credential_module = SimpleNamespace(load_pool=lambda provider: events.append(("load", provider)) or _FakePool([], None))
-
-    with patch.dict("sys.modules", {"agent": SimpleNamespace(), "agent.secret_scope": secret_module}):
-        plugin_api._load_pool_for_profile(credential_module, "anthropic", Path("/tmp/fake-home"))
-
-    assert events == [("set", "/tmp/fake-home"), ("load", "anthropic"), ("reset", "reset-token")]
 
 
 def load_tests(loader, tests, pattern):

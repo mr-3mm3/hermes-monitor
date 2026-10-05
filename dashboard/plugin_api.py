@@ -242,16 +242,6 @@ async def _collect_usage_provider(
     try:
         pool = pool or importlib.import_module("agent.credential_pool").load_pool(provider)
         active = pool.peek()
-        expires_at_ms = getattr(active, "expires_at_ms", None) if active else None
-        if (
-            provider == "anthropic"
-            and active is not None
-            and getattr(active, "refresh_token", None)
-            and isinstance(expires_at_ms, (int, float))
-            and expires_at_ms <= time.time() * 1000 + 120_000
-            and callable(getattr(pool, "select", None))
-        ):
-            active = pool.select()
         entries = sorted(pool.entries(), key=lambda entry: getattr(entry, "priority", 0))
     except Exception as error:
         entries, active = [], None
@@ -313,15 +303,17 @@ async def _collect_usage_from_snapshots(
     snapshots: list[_PoolEntrySnapshot],
     label: str | None,
     shared: dict[str, Any] | None,
+    active: bool = False,
 ) -> dict[str, Any]:
-    """Collect usage from a SIBLING profile's immutable snapshots, strictly read-only.
+    """Collect usage from a profile's immutable snapshots, strictly read-only.
 
-    An expired sibling OAuth token is fetched as-is (and reports ``n/a`` on failure); it is never
-    refreshed. Sibling accounts are always ``active=False`` — only the backend's own profile can
-    mark an account active.
+    An expired OAuth token is fetched as-is (and reports ``n/a`` on failure); it is never
+    refreshed. The first priority-sorted account is marked active only for the backend's own
+    profile, without invoking the mutating ``CredentialPool.peek()``/``select()`` path.
     """
     if not snapshots:
         return {"pool_size": 0, "provider_label": label, "failure": None, "accounts": []}
+    snapshots = sorted(snapshots, key=lambda snapshot: snapshot.priority)
     secrets = tuple(
         secret for snapshot in snapshots for secret in (snapshot.access_token, snapshot.refresh_token) if secret
     )
@@ -335,7 +327,7 @@ async def _collect_usage_from_snapshots(
             {
                 "entry_id": snapshot.entry_id,
                 "account_label": _safe_account_label(snapshot, index, secrets),
-                "active": False,
+                "active": active and index == 0,
                 "source": results[index],
             }
             for index, snapshot in enumerate(snapshots)
@@ -446,7 +438,15 @@ def _enumerate_profiles() -> list[tuple[str, Path]]:
     a credential-shaped label into the response.
     """
     root = _hermes_home()
-    profiles: list[tuple[str, Path]] = [("default", root)]
+    try:
+        own_home = Path(importlib.import_module("hermes_constants").get_hermes_home()).expanduser()
+    except Exception:
+        configured = os.environ.get("HERMES_HOME")
+        own_home = Path(configured).expanduser() if configured else root
+    own_name = own_home.name if own_home.parent == root / "profiles" else "default"
+    profiles: list[tuple[str, Path]] = [(own_name, own_home)]
+    if own_home != root:
+        profiles.append(("default", root))
     profiles_dir = root / "profiles"
     try:
         children = sorted((entry for entry in profiles_dir.iterdir() if entry.is_dir()), key=lambda p: p.name)
@@ -454,7 +454,7 @@ def _enumerate_profiles() -> list[tuple[str, Path]]:
         return profiles
     for child in children:
         name = child.name
-        if name == "default":
+        if child == own_home or name == "default":
             # The root home is already labelled "default"; a sibling directory of the same name
             # is either a stray or a duplicate of the root profile, so it is not enumerated.
             continue
@@ -511,30 +511,6 @@ def _home_override_api() -> tuple[Any, Any]:
     return None, None
 
 
-def _load_pool_for_profile(credential_module: Any, provider: str, home_path: Path) -> Any:
-    """Load *provider*'s pool resolved against the backend's OWN home.
-
-    Only the backend's own profile is loaded this way: it is the one pool the plugin is allowed
-    to mutate (``select()`` refresh of its own token). The read runs inside the profile's secret
-    scope and the context-local home override; the override is reset before the pool is handed
-    back, so the live pool is always scoped to the process home — which is the own home. When the
-    override API is unavailable the pool simply loads against the process home (correct here, and
-    never used for siblings — those go through ``_snapshot_pool_for_profile``).
-    """
-    set_override, reset_override = _home_override_api()
-    secret_token = _install_secret_scope(home_path)
-    try:
-        if set_override is not None:
-            token = set_override(str(home_path))
-            try:
-                return credential_module.load_pool(provider)
-            finally:
-                reset_override(token)
-        return credential_module.load_pool(provider)
-    finally:
-        _reset_secret_scope(secret_token)
-
-
 @dataclass(frozen=True)
 class _PoolEntrySnapshot:
     """Immutable read-only view of one credential-pool row.
@@ -579,29 +555,32 @@ def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot
 
 
 def _snapshot_pool_for_profile(
-    credential_module: Any, provider: str, home_path: Path
+    credential_module: Any, provider: str, home_path: Path, *, own: bool = False
 ) -> list[_PoolEntrySnapshot] | None:
-    """Read-only immutable snapshot of a SIBLING profile's pool entries.
+    """Read-only immutable snapshot of a profile's pool entries.
 
-    Built entirely inside the sibling's home + secret scope using ``read_credential_pool`` (a
+    Built entirely inside the profile's home + secret scope using ``read_credential_pool`` (a
     plain auth.json read). Never ``load_pool`` (which seeds/prunes and persists), ``peek``,
     ``select``, ``reclaim`` or ``_available_entries``. Returns ``None`` when the context-local
     home override is unavailable, so the caller skips that sibling instead of falling back to a
     process-global env swap.
     """
-    set_override, reset_override = _home_override_api()
-    if set_override is None:
-        return None
     read_credential_pool = getattr(credential_module, "read_credential_pool", None)
     if not callable(read_credential_pool):
         return None
+    set_override, reset_override = _home_override_api()
+    if not own and set_override is None:
+        return None
     secret_token = _install_secret_scope(home_path)
     try:
-        token = set_override(str(home_path))
-        try:
+        if own:
             rows = read_credential_pool(provider)
-        finally:
-            reset_override(token)
+        else:
+            token = set_override(str(home_path))
+            try:
+                rows = read_credential_pool(provider)
+            finally:
+                reset_override(token)
     finally:
         _reset_secret_scope(secret_token)
     if not isinstance(rows, list):
@@ -628,36 +607,24 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
     shared: dict[str, Any] = {}
     failures: set[str] = set()
     for profile_index, (profile_name, home_path) in enumerate(profiles):
-        if profile_index == 0:
-            # Backend's OWN home: the one pool the plugin may mutate (refresh its own token).
-            pool = None
-            try:
-                pool = _load_pool_for_profile(credential_module, provider, home_path)
-            except Exception as error:
-                # A broken home must not erase the provider: fall back to the singleton
-                # resolver (``_collect_usage_provider`` retries the pool, then the singleton)
-                # and remember why, so the failure is reported instead of hidden.
-                failures.add(_failure_name(error))
-            try:
-                envelope = await _collect_usage_provider(provider, pool, label, shared)
-            except Exception as error:
-                failures.add(_failure_name(error))
-                continue
-        else:
-            # SIBLING profile: strictly read-only immutable snapshot. A sibling whose
-            # override API is unavailable (``None``) is skipped — no env swap, ever.
-            try:
-                snapshots = _snapshot_pool_for_profile(credential_module, provider, home_path)
-            except Exception as error:
-                failures.add(_failure_name(error))
-                continue
-            if snapshots is None:
-                continue
-            try:
-                envelope = await _collect_usage_from_snapshots(provider, snapshots, label, shared)
-            except Exception as error:
-                failures.add(_failure_name(error))
-                continue
+        # Every profile, including the active one, is read through an immutable snapshot.
+        # This keeps quota reads from pruning, refreshing, or persisting any auth.json.
+        try:
+            snapshots = _snapshot_pool_for_profile(
+                credential_module, provider, home_path, own=profile_index == 0
+            )
+        except Exception as error:
+            failures.add(_failure_name(error))
+            continue
+        if snapshots is None:
+            continue
+        try:
+            envelope = await _collect_usage_from_snapshots(
+                provider, snapshots, label, shared, active=profile_index == 0
+            )
+        except Exception as error:
+            failures.add(_failure_name(error))
+            continue
         if envelope.get("failure"):
             failures.add(str(envelope["failure"]))
         for account in envelope.get("accounts", []):
