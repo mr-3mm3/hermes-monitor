@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.4
+## 0.3.5
 
 - Security: quota reads now resolve the active Hermes profile as their own home and use immutable credential snapshots for every profile, including the active profile. The root home is still included as a read-only sibling when a named profile is active, preventing expired root credentials from being refreshed or copied into the active profile's `auth.json`.
 
