@@ -28,6 +28,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   GlyphSpinner,
+  PALETTE_AREA,
   STATUSBAR_AREAS,
   Tooltip,
   TooltipContent,
@@ -789,11 +790,38 @@ export default {
       render: () => jsx(WorkerChip, { ctx })
     })
 
+    // Desktop-local preference, independent of the installed package/mirror.
+    let showQuotaChip = ctx.storage.get('showQuotaChip', true) !== false
+    let removeQuotaChip
+    const syncQuotaChip = () => {
+      removeQuotaChip?.()
+      removeQuotaChip = undefined
+      if (showQuotaChip) {
+        removeQuotaChip = ctx.register({
+          id: 'quote',
+          area: STATUSBAR_AREAS.right,
+          order: 150,
+          render: () => jsx(QuoteChip, { ctx })
+        })
+      }
+    }
+    syncQuotaChip()
     ctx.register({
-      id: 'quote',
-      area: STATUSBAR_AREAS.right,
-      order: 150,
-      render: () => jsx(QuoteChip, { ctx })
+      id: 'toggle-quota-chip',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-monitor.toggle-quota-chip',
+        label: 'Hermes Monitor: Toggle quota chip',
+        keywords: ['quotas', 'showQuotaChip', 'hide', 'show'],
+        detail: () => showQuotaChip ? 'on' : 'off',
+        detailVariant: 'state',
+        keepOpen: true,
+        run: () => {
+          showQuotaChip = !showQuotaChip
+          ctx.storage.set('showQuotaChip', showQuotaChip)
+          syncQuotaChip()
+        }
+      }
     })
   }
 }
