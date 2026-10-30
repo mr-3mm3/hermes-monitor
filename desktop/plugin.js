@@ -108,6 +108,13 @@ function formatDuration(totalSeconds) {
 }
 
 /** seconds-since-last-activity -> "Ns ago" / "Nm ago" / "Nh ago". */
+function formatRunTime(w) {
+  const run = formatDuration(w.duration_s)
+  const age = w.card_age_s
+  // Show card age as secondary text only when it is materially older than this run.
+  return typeof age === 'number' && age - w.duration_s >= 600 ? `run ${run} · card ${formatDuration(age)}` : run
+}
+
 function formatLastActivity(sec) {
   if (!Number.isFinite(sec)) return 'n/a'
   const s = Math.max(0, Math.floor(sec))
@@ -259,7 +266,7 @@ function renderWorkerRow(w) {
             }),
             jsx('span', {
               className: 'shrink-0 tabular-nums text-(--ui-text-quaternary)',
-              children: formatDuration(w.duration_s)
+              children: formatRunTime(w)
             })
           ]
         }),

@@ -92,10 +92,26 @@ def _load_running_tasks() -> list[dict[str, Any]]:
     database = _hermes_home() / "kanban.db"
     with closing(_readonly_connection(database)) as connection:
         rows = connection.execute(
-            "SELECT id, title, assignee, started_at FROM tasks WHERE status = ? ORDER BY started_at, id",
+            "SELECT t.id, t.title, t.assignee, t.started_at, r.started_at, r.last_heartbeat_at, "
+            "(SELECT MAX(created_at) FROM task_events WHERE task_id = t.id), "
+            "(SELECT MAX(created_at) FROM task_comments WHERE task_id = t.id) "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = ? ORDER BY t.started_at, t.id",
             ("running",),
         ).fetchall()
-    return [{"id": row[0], "title": row[1], "assignee": row[2], "started_at": row[3], "kanban_url": None} for row in rows]
+    return [
+        {
+            "id": row[0],
+            "title": row[1],
+            "assignee": row[2],
+            "started_at": row[3],
+            "run_started_at": row[4],
+            "last_heartbeat_at": row[5],
+            "last_event_at": max((v for v in (row[6], row[7]) if v), default=None),
+            "kanban_url": None,
+        }
+        for row in rows
+    ]
 
 
 def _safe_profile_database(assignee: str) -> Path | None:
@@ -130,7 +146,7 @@ def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     database = _safe_profile_database(str(task.get("assignee") or ""))
     if database is None:
         return []
-    started = float(task.get("started_at") or 0)
+    started = float(task.get("run_started_at") or task.get("started_at") or 0)
     with closing(_readonly_connection(database)) as connection:
         session = connection.execute(
             "SELECT id FROM sessions WHERE source = ? AND started_at >= ? ORDER BY ABS(started_at - ?) LIMIT 1",
