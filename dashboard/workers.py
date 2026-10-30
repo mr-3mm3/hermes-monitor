@@ -49,9 +49,19 @@ def build_workers_response(
     workers: list[dict[str, Any]] = []
     for task in tasks:
         card_id = str(task["id"])
-        started_at = int(task.get("started_at") or now)
+        # Elapsed is measured from the *current run's* start, not the card's first
+        # start (task.started_at spans every earlier run and scheduled wait).
+        card_started_at = int(task.get("started_at") or now)
+        started_at = int(task.get("run_started_at") or card_started_at)
         events = sorted(activity_by_card.get(card_id, ()), key=lambda event: float(event.get("timestamp") or 0))
-        last_timestamp = float(events[-1].get("timestamp") or 0) if events else None
+        # Last activity is the newest of tool activity, the run heartbeat and the latest
+        # task event/comment, so a live worker is never "n/a" while any signal exists.
+        candidates = [float(events[-1].get("timestamp") or 0)] if events else []
+        for key in ("last_heartbeat_at", "last_event_at"):
+            value = task.get(key)
+            if value:
+                candidates.append(float(value))
+        last_timestamp = max(candidates) if candidates else None
         last_activity_s = max(0, int(now - last_timestamp)) if last_timestamp is not None else None
         if is_repeated_tool_loop(events):
             state = "loop"
@@ -66,6 +76,7 @@ def build_workers_response(
                 "assignee": str(task.get("assignee") or ""),
                 "running_since": started_at,
                 "duration_s": max(0, now - started_at),
+                "card_age_s": max(0, now - card_started_at),
                 "last_activity_s": last_activity_s,
                 "state": state,
                 "kanban_url": task.get("kanban_url") if isinstance(task.get("kanban_url"), str) else None,

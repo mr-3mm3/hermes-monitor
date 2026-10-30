@@ -62,6 +62,8 @@ Loop has priority over stalled, and stalled has priority over active when severa
 
 ## Quotas
 
+The Desktop-local `showQuotaChip` option defaults to `true`. Use Command-K → **Hermes Monitor: Toggle quota chip** to hide/show it immediately. The preference persists in the plugin's namespaced Desktop storage across plugin reloads, package reinstalls and Desktop re-mirroring; the worker chip is unaffected. A hidden quota chip is not registered, so its quota polling is not mounted.
+
 The quota item shows used percentage and reset time for the Claude five-hour and weekly windows and the windows returned by Codex. DeepSeek shows the remaining account balance. Missing credentials or provider failures are displayed as `n/a` and do not interrupt the status bar.
 
 Accounts are collected from every Hermes profile (the default profile plus each named profile under `profiles/`), deduplicated, and labelled with the profile they come from, so a provider reports its accounts wherever they are configured.
@@ -90,6 +92,7 @@ Requirements: Python 3.11+ with `pytest`, and Node.js for the syntax check. The 
 ```sh
 python3 -m pytest tests/ -q
 node --check desktop/plugin.js
+node --test tests/desktop-settings.test.mjs
 ```
 
 The backend lives in `dashboard/` (`plugin_api.py` wires the routes, `workers.py` and `quotas.py` hold the pure transformations) and the Desktop half is the single module `desktop/plugin.js`.
